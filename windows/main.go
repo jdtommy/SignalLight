@@ -6,35 +6,75 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"signallight/ble"
+	"signallight/config"
 	"signallight/hotkey"
 	"signallight/serial"
 	"signallight/server"
+	"signallight/session"
 	"signallight/state"
+	"signallight/tray"
 	"signallight/zoom"
+
+	"github.com/energye/systray"
 )
 
 func main() {
 	useBle := flag.Bool("ble", true, "Connect to Arduino via Bluetooth Low Energy (default true)")
-	bleDeviceName := flag.String("device", "SignalLight", "BLE device advertisement name")
+	targetMAC := flag.String("mac", "", "Target BLE MAC address (e.g. E8:F6:0A:BE:69:F5, overrides config)")
+	bleDeviceName := flag.String("device", "", "Target BLE device advertisement name (overrides config)")
+	secretFlag := flag.String("secret", "", "Shared security secret / PIN (overrides config)")
 	serialPort := flag.String("serial", "", "Serial COM port to use (e.g. COM3 or 'auto', empty to disable)")
-	httpPort := flag.String("port", ":8080", "HTTP port for web dashboard & API")
+	httpPort := flag.String("port", "", "HTTP port for web dashboard & API (default: auto-assign open port)")
+	useTray := flag.Bool("tray", true, "Enable Windows system tray icon (default true)")
 	zoomSecret := flag.String("zoom-secret", "", "Zoom webhook verification secret (optional)")
 	checkInterval := flag.Duration("interval", 1*time.Second, "Zoom polling interval")
 	flag.Parse()
 
+	// Load stored configuration from %APPDATA%\SignalLight\config.json
+	cfg, err := config.Load()
+	if err != nil {
+		log.Printf("[Config] Warning: error reading config: %v", err)
+	}
+
+	// Command-line flag overrides
+	if *targetMAC != "" {
+		cfg.TargetMAC = strings.ToUpper(strings.TrimSpace(*targetMAC))
+	}
+	if *bleDeviceName != "" {
+		cfg.DeviceName = strings.TrimSpace(*bleDeviceName)
+	}
+	if *secretFlag != "" {
+		cfg.SharedSecret = strings.TrimSpace(*secretFlag)
+	}
+
+	// Resolve open port and listener for the web server
+	listener, portNum, err := server.ResolveListener(*httpPort, cfg)
+	if err != nil {
+		log.Fatalf("[Web] Fatal error resolving port: %v", err)
+	}
+
+	displayHost := fmt.Sprintf("localhost:%d", portNum)
+
 	fmt.Println("==================================================")
 	fmt.Println("        SignalLight Controller for Windows        ")
 	fmt.Println("==================================================")
+	if cfg.Paired && cfg.TargetMAC != "" {
+		fmt.Printf("Paired Device: %s (%s)\n", cfg.DeviceName, cfg.TargetMAC)
+	} else {
+		fmt.Println("Paired Device: None (Open Web Dashboard to pair)")
+	}
+	fmt.Println("Config File:   " + config.GetConfigPath())
 	fmt.Println("Hotkeys:")
 	fmt.Println("  [Ctrl + Shift + G] -> Set GREEN  (Available / Free)")
 	fmt.Println("  [Ctrl + Shift + Y] -> Set YELLOW (Away / Not at Desk)")
 	fmt.Println("  [Ctrl + Shift + R] -> Set RED    (In Meeting / Busy)")
 	fmt.Println("  [Ctrl + Shift + A] -> Set AUTO   (Sync with Zoom)")
-	fmt.Println("Web Dashboard: http://localhost" + *httpPort)
+	fmt.Println("Web Dashboard: http://" + displayHost)
 	fmt.Println("==================================================")
 
 	stateMgr := state.NewManager()
@@ -62,7 +102,9 @@ func main() {
 	// Start BLE client if enabled
 	if *useBle {
 		bleClient = ble.NewClient(
-			*bleDeviceName,
+			cfg.TargetMAC,
+			cfg.DeviceName,
+			cfg.SharedSecret,
 			func() {
 				stateMgr.SetConnected(true)
 				curr := stateMgr.GetStatus()
@@ -75,6 +117,12 @@ func main() {
 				}
 			},
 		)
+
+		bleClient.SetOnUnpaired(func() {
+			log.Println("[BLE] Device announced it is UNPAIRED (hardware reset). Clearing local config.")
+			_ = config.Clear()
+			stateMgr.SetConnected(false)
+		})
 
 		if err := bleClient.Start(); err != nil {
 			log.Printf("[BLE] Failed to initialize BLE: %v", err)
@@ -108,6 +156,17 @@ func main() {
 	detector.Start()
 	log.Println("[Zoom] Meeting detector started.")
 
+	// Start Windows Session Lock watcher
+	sessionWatcher := session.NewWatcher(func(locked bool) {
+		log.Printf("[Session] Lock state changed: locked=%v", locked)
+		stateMgr.OnSessionLockChanged(locked)
+	})
+	if err := sessionWatcher.Start(); err != nil {
+		log.Printf("[Session] Warning: failed to start session lock watcher: %v", err)
+	} else {
+		log.Println("[Session] Session lock watcher started.")
+	}
+
 	// Start Global Hotkeys
 	hkListener := hotkey.NewListener(func(action hotkey.Action) {
 		switch action {
@@ -132,23 +191,40 @@ func main() {
 	}
 
 	// Start Web Server
-	webSrv := server.NewServer(*httpPort, stateMgr, *zoomSecret)
-	if err := webSrv.Start(); err != nil {
+	webSrv := server.NewServer(displayHost, stateMgr, bleClient, *zoomSecret)
+	if err := webSrv.Start(listener); err != nil {
 		log.Printf("[Web] Failed to start server: %v", err)
 	}
 
-	// Wait for termination signal
+	cleanup := func() {
+		log.Println("\nShutting down SignalLight...")
+		detector.Stop()
+		sessionWatcher.Stop()
+		if listener != nil {
+			_ = listener.Close()
+		}
+		if bleClient != nil {
+			bleClient.Stop()
+		}
+		if serialClient != nil {
+			serialClient.Stop()
+		}
+		log.Println("Goodbye!")
+	}
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
 
-	log.Println("\nShutting down SignalLight...")
-	detector.Stop()
-	if bleClient != nil {
-		bleClient.Stop()
+	if *useTray {
+		onReady, onExit := tray.SetupTray(stateMgr, displayHost, cleanup)
+		go func() {
+			<-sigChan
+			systray.Quit()
+		}()
+		log.Println("[Tray] Starting system tray icon...")
+		systray.Run(onReady, onExit)
+	} else {
+		<-sigChan
+		cleanup()
 	}
-	if serialClient != nil {
-		serialClient.Stop()
-	}
-	log.Println("Goodbye!")
 }

@@ -95,13 +95,27 @@ If you flashed MicroPython onto the Nano ESP32:
 The Windows app is written in **Go (Golang)**. It features:
 1. **Bluetooth Low Energy (BLE)**: Automatically scans for and connects to the Nano ESP32 wirelessly.
 2. **Zoom Meeting Detection**: Detects active Zoom meetings automatically with **zero configuration** by monitoring Zoom meeting windows (`ZPContentViewWnd`, `ZPFloatVideoWndClass`, and meeting titles).
-3. **Global Hotkeys**:
+3. **Screen Lock Detection:** Automatically detects when you lock your Windows workstation (<kbd>Win</kbd> + <kbd>L</kbd> or idle screen timeout):
+   - Automatically switches to 🟡 **YELLOW (Away)** when locked.
+   - Automatically restores 🟢 **GREEN (Available)** when unlocked.
+   - Priority rule: 🔴 **Zoom Meeting (RED)** always takes precedence over the lock screen.
+4. **Global Hotkeys**:
    - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd> : Set **GREEN** (Free / Available)
    - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Y</kbd> : Set **YELLOW** (Away / Not at Desk)
    - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd> : Set **RED** (Busy / In Meeting)
-   - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>A</kbd> : Set **AUTO** (Resume syncing with Zoom)
-4. **Interactive Web Dashboard**: Visit `http://localhost:8080` to see real-time status and manually click buttons from any browser on your machine.
-5. **Fail-safe Heartbeat**: Continuously pings the Arduino. If your PC goes to sleep or disconnects, the Arduino automatically defaults back to **YELLOW** after 15 seconds.
+   - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>A</kbd> : Set **AUTO** (Resume syncing with Zoom & Lock)
+5. **Windows System Tray Icon:** A live, color-coded icon in your taskbar notification area:
+   - Dynamic icon color: 🟢 Green, 🟡 Yellow, or 🔴 Red matching current status.
+   - Click to open quick menu:
+     - View current status & mode
+     - Force Green (Available)
+     - Force Yellow (Away)
+     - Force Red (Busy)
+     - Enable Auto Mode (Sync with Zoom & Lock)
+     - Open Web Dashboard
+     - Exit application
+6. **Interactive Web Dashboard**: Automatically assigns an open local port (e.g. `http://localhost:9439`), displayed on startup and saved to config so bookmarks stay valid. Visit the dashboard to pair devices, see real-time status, and control the light from any browser.
+7. **Fail-safe Heartbeat**: Continuously pings the Arduino. If your PC goes to sleep or disconnects, the Arduino automatically defaults back to **YELLOW** after 15 seconds.
 
 ### Running the App
 
@@ -122,9 +136,9 @@ go run .
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-ble` | `true` | Connect to Arduino over Bluetooth Low Energy |
-| `-device` | `"SignalLight"` | BLE advertised device name |
+| `-device` | `""` | BLE advertised device name (overrides config) |
 | `-serial` | `""` | Optional USB COM port (e.g. `COM3` or `auto`) if using USB cable |
-| `-port` | `":8080"` | Web dashboard port |
+| `-port` | `""` | Web dashboard port (default: auto-allocated open port, e.g. 9120-9900, saved in config.json) |
 | `-interval` | `1s` | Zoom meeting polling interval |
 
 ---

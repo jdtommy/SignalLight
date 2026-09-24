@@ -21,29 +21,34 @@ const (
 )
 
 type Status struct {
-	Color       LightColor `json:"color"`
-	Mode        Mode       `json:"mode"`
-	ZoomMeeting bool       `json:"zoom_meeting"`
-	Connected   bool       `json:"connected"`
+	Color         LightColor `json:"color"`
+	Mode          Mode       `json:"mode"`
+	ZoomMeeting   bool       `json:"zoom_meeting"`
+	SessionLocked bool       `json:"session_locked"`
+	Connected     bool       `json:"connected"`
 }
 
 type Listener func(status Status)
 
 type Manager struct {
-	mu          sync.RWMutex
-	color       LightColor
-	mode        Mode
-	zoomMeeting bool
-	connected   bool
-	listeners   []Listener
+	mu              sync.RWMutex
+	color           LightColor
+	mode            Mode
+	lastManualColor LightColor
+	zoomMeeting     bool
+	sessionLocked   bool
+	connected       bool
+	listeners       []Listener
 }
 
 func NewManager() *Manager {
 	return &Manager{
-		color:       ColorYellow, // Default to Yellow on startup
-		mode:        ModeAuto,
-		zoomMeeting: false,
-		connected:   false,
+		color:           ColorOff, // Disconnected initially -> no light
+		mode:            ModeAuto,
+		lastManualColor: ColorGreen,
+		zoomMeeting:     false,
+		sessionLocked:   false,
+		connected:       false,
 	}
 }
 
@@ -55,13 +60,20 @@ func (m *Manager) Subscribe(fn Listener) {
 
 func (m *Manager) notify() {
 	status := Status{
-		Color:       m.color,
-		Mode:        m.mode,
-		ZoomMeeting: m.zoomMeeting,
-		Connected:   m.connected,
+		Color:         m.color,
+		Mode:          m.mode,
+		ZoomMeeting:   m.zoomMeeting,
+		SessionLocked: m.sessionLocked,
+		Connected:     m.connected,
 	}
 	for _, fn := range m.listeners {
-		go fn(status)
+		listener := fn
+		go func() {
+			defer func() {
+				_ = recover()
+			}()
+			listener(status)
+		}()
 	}
 }
 
@@ -69,11 +81,27 @@ func (m *Manager) GetStatus() Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return Status{
-		Color:       m.color,
-		Mode:        m.mode,
-		ZoomMeeting: m.zoomMeeting,
-		Connected:   m.connected,
+		Color:         m.color,
+		Mode:          m.mode,
+		ZoomMeeting:   m.zoomMeeting,
+		SessionLocked: m.sessionLocked,
+		Connected:     m.connected,
 	}
+}
+
+// evaluateAutoColor calculates the appropriate color in AUTO mode.
+// Priority: Disconnected (OFF) > Zoom Meeting (RED) > Screen Locked (YELLOW) > Available (GREEN)
+func (m *Manager) evaluateAutoColor() LightColor {
+	if !m.connected {
+		return ColorOff
+	}
+	if m.zoomMeeting {
+		return ColorRed
+	}
+	if m.sessionLocked {
+		return ColorYellow
+	}
+	return ColorGreen
 }
 
 func (m *Manager) SetConnected(connected bool) {
@@ -81,6 +109,18 @@ func (m *Manager) SetConnected(connected bool) {
 	defer m.mu.Unlock()
 	if m.connected != connected {
 		m.connected = connected
+		if !connected {
+			m.color = ColorOff
+		} else {
+			if m.mode == ModeAuto {
+				m.color = m.evaluateAutoColor()
+			} else {
+				if m.lastManualColor == "" {
+					m.lastManualColor = ColorGreen
+				}
+				m.color = m.lastManualColor
+			}
+		}
 		m.notify()
 	}
 }
@@ -92,11 +132,19 @@ func (m *Manager) OnZoomMeetingChanged(inMeeting bool) {
 
 	m.zoomMeeting = inMeeting
 	if m.mode == ModeAuto {
-		if inMeeting {
-			m.color = ColorRed
-		} else {
-			m.color = ColorGreen // Zoom finished -> available
-		}
+		m.color = m.evaluateAutoColor()
+		m.notify()
+	}
+}
+
+// OnSessionLockChanged updates state when Windows workstation is locked or unlocked.
+func (m *Manager) OnSessionLockChanged(locked bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sessionLocked = locked
+	if m.mode == ModeAuto {
+		m.color = m.evaluateAutoColor()
 		m.notify()
 	}
 }
@@ -106,21 +154,22 @@ func (m *Manager) SetManualColor(c LightColor) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.color = c
+	m.lastManualColor = c
 	m.mode = ModeManual
+	if m.connected {
+		m.color = c
+	} else {
+		m.color = ColorOff
+	}
 	m.notify()
 }
 
-// SetAutoMode returns to automatic Zoom synchronization.
+// SetAutoMode returns to automatic Zoom and Lock synchronization.
 func (m *Manager) SetAutoMode() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.mode = ModeAuto
-	if m.zoomMeeting {
-		m.color = ColorRed
-	} else {
-		m.color = ColorGreen
-	}
+	m.color = m.evaluateAutoColor()
 	m.notify()
 }

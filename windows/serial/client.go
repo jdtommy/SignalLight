@@ -69,6 +69,14 @@ func (c *Client) IsConnected() bool {
 }
 
 func (c *Client) lifecycleLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Serial] Caught serial driver exception: %v. Restarting in 3s...", r)
+			time.Sleep(3 * time.Second)
+			go c.lifecycleLoop()
+		}
+	}()
+
 	for {
 		select {
 		case <-c.stopChan:

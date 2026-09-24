@@ -7,80 +7,141 @@
  *   - Pin D3: YELLOW LED (Away / Default)
  *   - Pin D4: GREEN LED (Available / Free)
  * 
- * Electrical Safety Note:
- *   The ESP32-S3 operates on 3.3V logic. If you are using a pull-up resistor
- *   on D3 to keep Yellow on by default, connect the 10k resistor to the 3.3V pin 
- *   (labeled 3V3) instead of 5V to keep within the ESP32's safe input voltage!
- *   Driving 12V LEDs should be done via logic-level N-MOSFETs or a driver module.
- * 
- * Control interfaces:
- *   1. Bluetooth Low Energy (BLE) - Local Name: "SignalLight"
- *      - Service UUID:        19B10000-E8F2-537E-4F6C-D104768A1214
- *      - Characteristic UUID: 19B10001-E8F2-537E-4F6C-D104768A1214
- *      Values: 'R' (Red), 'Y' (Yellow), 'G' (Green), '0' (Off), 'P' (Ping/Heartbeat)
- * 
- *   2. USB Serial (115200 baud)
- *      Commands: "RED\n", "YELLOW\n", "GREEN\n", "OFF\n", "PING\n"
- * 
- * Failsafe:
- *   If disconnected or no heartbeat received within 15 seconds,
- *   the system automatically defaults back to YELLOW ON.
+ * Identity & Security:
+ *   - Unpaired: Advertises as "SignalLight-[Last 4 MAC]" (e.g. SignalLight-69F5).
+ *               Yellow LED pulses to indicate awaiting pairing.
+ *   - Paired:   Advertises with custom name (e.g. "Office Desk").
+ *               Requires "AUTH:<secret>" handshake within 4s of connection.
+ *   - Reset:    Press the physical Reset button TWICE within 3s to factory reset.
+ *               Or write "UNPAIR" from the app, or type "FACTORY_RESET" in Serial.
  */
 
 #include <ArduinoBLE.h>
+#include <Preferences.h>
+#include <esp_mac.h>
 
-// Pin definitions
+// External LED Pin definitions
 const int PIN_RED    = D2;
 const int PIN_YELLOW = D3;
 const int PIN_GREEN  = D4;
 
+// On-board RGB LED is defined by Arduino Nano ESP32 core (LED_RED, LED_GREEN, LED_BLUE: Active-LOW)
+
 // BLE UUIDs
 const char* BLE_SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214";
 const char* BLE_CHAR_UUID    = "19B10001-E8F2-537E-4F6C-D104768A1214";
+const char* BLE_AUTH_UUID    = "19B10002-E8F2-537E-4F6C-D104768A1214";
 
 BLEService lightService(BLE_SERVICE_UUID);
 BLEByteCharacteristic lightCharacteristic(BLE_CHAR_UUID, BLERead | BLEWrite | BLEWriteWithoutResponse | BLENotify);
+BLEStringCharacteristic authCharacteristic(BLE_AUTH_UUID, BLERead | BLEWrite | BLENotify, 64);
 
-// Failsafe watchdog timer (15 seconds)
+// NVS Persistent Storage
+Preferences prefs;
+bool isPaired = false;
+String deviceName = "";
+String sharedSecret = "";
+
+// Security & Connection State
+BLEDevice activeCentral;
+bool isCentralConnected = false;
+bool isAuthenticated = false;
+unsigned long connectTime = 0;
+const unsigned long AUTH_TIMEOUT_MS = 4000;
+
+// Watchdog timer (15 seconds)
 const unsigned long HEARTBEAT_TIMEOUT_MS = 15000;
 unsigned long lastHeartbeatTime = 0;
 char currentColor = 'Y';
 
+// Double-press reset detection via flash (survives power cycles and EN pin reset)
+unsigned long bootTime = 0;
+bool resetArmed = false;
+
+// Control the onboard RGB LED (active-LOW logic) and onboard Yellow LED (LED_BUILTIN)
+void setOnboardRGB(bool redOn, bool greenOn, bool blueOn) {
+  digitalWrite(LED_RED, redOn ? LOW : HIGH);
+  digitalWrite(LED_GREEN, greenOn ? LOW : HIGH);
+  digitalWrite(LED_BLUE, blueOn ? LOW : HIGH);
+  digitalWrite(LED_BUILTIN, (redOn && greenOn && !blueOn) ? HIGH : LOW);
+}
+
+void flashLED(int pin, int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(pin, HIGH);
+    if (pin == PIN_RED) {
+      setOnboardRGB(true, false, false);
+    } else if (pin == PIN_GREEN) {
+      setOnboardRGB(false, true, false);
+    }
+    delay(delayMs);
+
+    digitalWrite(pin, LOW);
+    setOnboardRGB(false, false, false);
+    delay(delayMs);
+  }
+}
+
 void applyColor(char c) {
   currentColor = c;
   
-  // Turn all OFF first (mutual exclusivity)
   digitalWrite(PIN_RED, LOW);
   digitalWrite(PIN_YELLOW, LOW);
   digitalWrite(PIN_GREEN, LOW);
 
   switch (c) {
-    case 'R': // RED - In Meeting
+    case 'R':
       digitalWrite(PIN_RED, HIGH);
+      setOnboardRGB(true, false, false); // Onboard RED
       Serial.println("[State] -> RED (In Meeting)");
       break;
-    case 'G': // GREEN - Available
+    case 'G':
       digitalWrite(PIN_GREEN, HIGH);
+      setOnboardRGB(false, true, false); // Onboard GREEN
       Serial.println("[State] -> GREEN (Available)");
       break;
-    case 'Y': // YELLOW - Away / Default
+    case 'Y':
     default:
       digitalWrite(PIN_YELLOW, HIGH);
+      setOnboardRGB(true, true, false);  // Onboard YELLOW (Red + Green)
       Serial.println("[State] -> YELLOW (Away / Default)");
       currentColor = 'Y';
       break;
-    case '0': // OFF
+    case '0':
+      setOnboardRGB(false, false, false); // All OFF
       Serial.println("[State] -> ALL OFF");
       break;
   }
 
-  // Update BLE characteristic value
   lightCharacteristic.writeValue((byte)currentColor);
 }
 
-void processCommand(char cmd) {
+void factoryReset() {
+  Serial.println("[Reset] Wiping settings from flash...");
+  prefs.begin("signallight", false);
+  prefs.clear();
+  prefs.end();
+
+  // Flash RED 3 times
+  digitalWrite(PIN_YELLOW, LOW);
+  digitalWrite(PIN_GREEN, LOW);
+  flashLED(PIN_RED, 3, 150);
+
+  Serial.println("[Reset] Factory reset complete. Deinitializing BLE and rebooting...");
+  delay(300);
+  BLE.end();
+  delay(100);
+  ESP.restart();
+}
+
+void processControlCommand(char cmd) {
+  if (isPaired && !isAuthenticated) {
+    Serial.println("[Security] Control command ignored: not authenticated.");
+    return;
+  }
+
   cmd = toupper(cmd);
-  lastHeartbeatTime = millis(); // Reset failsafe timer
+  lastHeartbeatTime = millis();
 
   switch (cmd) {
     case 'R':
@@ -95,10 +156,10 @@ void processCommand(char cmd) {
     case '0':
       applyColor('0');
       break;
-    case 'P': // Heartbeat Ping
-      // Keepalive received, no color change needed
+    case 'P':
+      // Heartbeat ping
       break;
-    case '?': // Query status
+    case '?':
       Serial.print("STATUS:");
       Serial.println(currentColor);
       break;
@@ -107,70 +168,303 @@ void processCommand(char cmd) {
   }
 }
 
+void processAuthMessage(String msg) {
+  msg.trim();
+  Serial.print("[Auth] Received message: ");
+  Serial.println(msg.startsWith("AUTH:") ? "AUTH:****" : (msg.startsWith("PAIR:") ? "PAIR:[name]:****" : msg));
+
+  // 1. Initial Pairing: "PAIR:<name>:<secret>"
+  if (msg.startsWith("PAIR:")) {
+    if (isPaired && !isAuthenticated) {
+      authCharacteristic.writeValue("ERR:ALREADY_PAIRED");
+      return;
+    }
+
+    int firstColon = msg.indexOf(':');
+    int secondColon = msg.indexOf(':', firstColon + 1);
+    if (secondColon == -1) {
+      authCharacteristic.writeValue("ERR:BAD_FORMAT");
+      return;
+    }
+
+    String newName = msg.substring(firstColon + 1, secondColon);
+    String newSecret = msg.substring(secondColon + 1);
+    newName.trim();
+    newSecret.trim();
+
+    if (newName.length() == 0 || newSecret.length() == 0) {
+      authCharacteristic.writeValue("ERR:EMPTY_FIELDS");
+      return;
+    }
+
+    // Save configuration to NVS
+    prefs.begin("signallight", false);
+    prefs.putBool("paired", true);
+    prefs.putString("name", newName);
+    prefs.putString("secret", newSecret);
+    prefs.putBool("rst_armed", false);
+    prefs.end();
+
+    isPaired = true;
+    deviceName = newName;
+    sharedSecret = newSecret;
+    isAuthenticated = true;
+
+    authCharacteristic.writeValue("PAIR_OK");
+    Serial.print("[Auth] Paired as '");
+    Serial.print(newName);
+    Serial.println("'. Connection maintained.");
+
+    digitalWrite(PIN_YELLOW, LOW);
+    flashLED(PIN_GREEN, 3, 150);
+    applyColor(currentColor);
+    return;
+  }
+
+  // 2. Authentication: "AUTH:<secret>"
+  if (msg.startsWith("AUTH:")) {
+    if (!isPaired) {
+      Serial.println("[Auth] Rejected AUTH: device is in factory unpaired mode.");
+      authCharacteristic.writeValue("ERR:NOT_PAIRED");
+      return;
+    }
+
+    String incomingSecret = msg.substring(5);
+    incomingSecret.trim();
+
+    if (incomingSecret.equals(sharedSecret)) {
+      isAuthenticated = true;
+      authCharacteristic.writeValue("AUTH_OK");
+      Serial.println("[Auth] Authentication SUCCESS.");
+      applyColor(currentColor);
+    } else {
+      authCharacteristic.writeValue("AUTH_FAIL");
+      Serial.println("[Auth] Authentication FAILED! Disconnecting central.");
+      delay(150);
+      if (activeCentral && activeCentral.connected()) {
+        activeCentral.disconnect();
+      }
+    }
+    return;
+  }
+
+  // 3. Unpair / Factory Reset: "UNPAIR"
+  if (msg.equals("UNPAIR")) {
+    if (isPaired && !isAuthenticated) {
+      authCharacteristic.writeValue("ERR:NOT_AUTHENTICATED");
+      return;
+    }
+    authCharacteristic.writeValue("UNPAIR_OK");
+    delay(200);
+    factoryReset();
+    return;
+  }
+
+  // 4. Status Query
+  if (msg.equals("STATUS?")) {
+    authCharacteristic.writeValue(isPaired ? "STATUS:PAIRED" : "STATUS:UNPAIRED");
+    return;
+  }
+}
+
+volatile bool needAdvertise = false;
+unsigned long disconnectTime = 0;
+
+void blePeripheralConnectHandler(BLEDevice central) {
+  activeCentral = central;
+  isCentralConnected = true;
+  connectTime = millis();
+  lastHeartbeatTime = millis();
+  isAuthenticated = !isPaired; // In unpaired mode, automatically allow connection
+
+  Serial.print("[BLE] Central connected: ");
+  Serial.println(central.address());
+
+  if (isPaired) {
+    authCharacteristic.writeValue("STATUS:PAIRED");
+    Serial.println("[BLE] Device is PAIRED. Waiting for AUTH:<secret> within 4s...");
+  } else {
+    authCharacteristic.writeValue("STATUS:UNPAIRED");
+    Serial.println("[BLE] Device is UNPAIRED. Ready for PAIR:<name>:<secret>");
+  }
+}
+
+void blePeripheralDisconnectHandler(BLEDevice central) {
+  Serial.print("[BLE] Central disconnected: ");
+  Serial.println(central.address());
+  isCentralConnected = false;
+  isAuthenticated = false;
+  needAdvertise = true;
+  disconnectTime = millis();
+}
+
 void setup() {
-  // Initialize GPIO pins
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_YELLOW, OUTPUT);
   pinMode(PIN_GREEN, OUTPUT);
 
-  // Default state: YELLOW ON immediately
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // Initial yellow state
   applyColor('Y');
-  lastHeartbeatTime = millis();
 
-  // Initialize USB Serial for debugging and fallback
   Serial.begin(115200);
-  delay(500);
-  Serial.println("=========================================");
+  delay(300);
+  Serial.println("\n=========================================");
   Serial.println("SignalLight Controller (Nano ESP32)");
-  Serial.println("Starting BLE advertising...");
 
-  // Initialize BLE
-  if (!BLE.begin()) {
-    Serial.println("ERR: Starting BLE failed!");
+  // 1. Double-Press Reset Detection via Flash
+  prefs.begin("signallight", false);
+  bool wasArmed = prefs.getBool("rst_armed", false);
+  if (wasArmed) {
+    // Reset occurred while rst_armed was true (user pressed Reset button twice within 4s)
+    Serial.println("[Reset] DOUBLE-PRESS DETECTED! Resetting to factory defaults...");
+    prefs.clear();
+    prefs.putBool("rst_armed", false);
+    prefs.end();
+
+    // Flash RED 3 times
+    digitalWrite(PIN_YELLOW, LOW);
+    digitalWrite(PIN_GREEN, LOW);
+    flashLED(PIN_RED, 3, 150);
+
+    Serial.println("[Reset] Factory reset complete. Continuing boot in unpaired mode...");
+    bootTime = millis();
+    resetArmed = false;
   } else {
-    BLE.setLocalName("SignalLight");
-    BLE.setDeviceName("SignalLight");
+    prefs.putBool("rst_armed", true);
+    prefs.end();
+    bootTime = millis();
+    resetArmed = true;
+  }
+
+  // 2. Read Factory Hardware MAC Address directly from eFuse
+  uint8_t baseMac[6];
+  esp_read_mac(baseMac, ESP_MAC_BT);
+  char macSuffix[5];
+  snprintf(macSuffix, sizeof(macSuffix), "%02X%02X", baseMac[4], baseMac[5]);
+  String defaultName = "SignalLight-" + String(macSuffix);
+
+  // 3. Load Saved Settings from Flash
+  prefs.begin("signallight", false);
+  isPaired = prefs.getBool("paired", false);
+  deviceName = prefs.getString("name", "");
+  sharedSecret = prefs.getString("secret", "");
+  prefs.end();
+
+  String activeName = defaultName;
+  if (isPaired && deviceName.length() > 0) {
+    activeName = deviceName;
+  }
+
+  Serial.print("[Config] Status: ");
+  Serial.println(isPaired ? "PAIRED" : "UNPAIRED");
+  Serial.print("[Config] Advertising Name: ");
+  Serial.println(activeName);
+
+  // 4. Initialize BLE (Only ONCE)
+  if (!BLE.begin()) {
+    Serial.println("ERR: BLE.begin() failed!");
+  } else {
+    BLE.setLocalName(activeName.c_str());
+    BLE.setDeviceName(activeName.c_str());
     BLE.setAdvertisedService(lightService);
 
     lightService.addCharacteristic(lightCharacteristic);
+    lightService.addCharacteristic(authCharacteristic);
     BLE.addService(lightService);
 
-    // Initial characteristic value: 'Y'
-    lightCharacteristic.writeValue((byte)'Y');
+    lightCharacteristic.writeValue((byte)currentColor);
+    authCharacteristic.writeValue(isPaired ? "STATUS:PAIRED" : "STATUS:UNPAIRED");
+
+    BLE.setEventHandler(BLEConnected, blePeripheralConnectHandler);
+    BLE.setEventHandler(BLEDisconnected, blePeripheralDisconnectHandler);
 
     BLE.advertise();
-    Serial.println("BLE advertising active as 'SignalLight'");
+    Serial.println("[BLE] Advertising active.");
   }
+
   Serial.println("Ready!");
   Serial.println("=========================================");
 }
 
 void loop() {
-  // 1. Process BLE events
-  BLE.poll();
+  unsigned long now = millis();
 
-  if (lightCharacteristic.written()) {
-    byte val = lightCharacteristic.value();
-    processCommand((char)val);
+  // 1. Disarm double-press reset detection after 4 seconds of stable uptime
+  if (resetArmed && (now - bootTime > 4000)) {
+    prefs.begin("signallight", false);
+    prefs.putBool("rst_armed", false);
+    prefs.end();
+    resetArmed = false;
+    Serial.println("[Reset] Double-press window expired. Reset disarmed.");
   }
 
-  // 2. Process USB Serial commands
+  // 2. Poll BLE stack
+  BLE.poll();
+
+  // 3. Restart advertising safely after disconnect (outside the callback)
+  if (needAdvertise && (now - disconnectTime >= 200)) {
+    needAdvertise = false;
+    Serial.println("[BLE] Resuming advertising...");
+    BLE.advertise();
+  }
+
+  // 5. Security Timeout Check
+  if (isCentralConnected && isPaired && !isAuthenticated) {
+    if (now - connectTime > AUTH_TIMEOUT_MS) {
+      Serial.println("[Security] Auth timeout exceeded! Disconnecting central.");
+      if (activeCentral && activeCentral.connected()) {
+        activeCentral.disconnect();
+      }
+    }
+  }
+
+  // 4. Handle Auth Characteristic
+  if (authCharacteristic.written()) {
+    String msg = authCharacteristic.value();
+    processAuthMessage(msg);
+  }
+
+  // 5. Handle Control Characteristic
+  if (lightCharacteristic.written()) {
+    byte val = lightCharacteristic.value();
+    processControlCommand((char)val);
+  }
+
+  // 6. Handle USB Serial Commands
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
-    if (input.length() > 0) {
+    if (input.equalsIgnoreCase("FACTORY_RESET") || input.equalsIgnoreCase("UNPAIR")) {
+      factoryReset();
+    } else if (input.length() > 0) {
       char firstChar = toupper(input.charAt(0));
-      processCommand(firstChar);
+      processControlCommand(firstChar);
     }
   }
 
-  // 3. Failsafe Watchdog:
-  // If no communication received for HEARTBEAT_TIMEOUT_MS, revert to YELLOW
-  if (millis() - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
+  // 7. Visual Pulse when Unpaired and Awaiting Connection
+  if (!isPaired && !isCentralConnected) {
+    int cycle = now % 1000;
+    if (cycle < 700) {
+      digitalWrite(PIN_YELLOW, HIGH);
+      setOnboardRGB(true, true, false); // Onboard Yellow (Red + Green)
+    } else {
+      digitalWrite(PIN_YELLOW, LOW);
+      setOnboardRGB(false, false, false); // Onboard OFF
+    }
+  }
+
+  // 8. Failsafe Watchdog (revert to Yellow if connection lost)
+  if (isPaired && (now - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS)) {
     if (currentColor != 'Y') {
-      Serial.println("[Watchdog] Connection lost or timeout expired. Reverting to YELLOW.");
+      Serial.println("[Watchdog] Heartbeat timeout. Reverting to YELLOW.");
       applyColor('Y');
     }
-    lastHeartbeatTime = millis(); // Avoid spamming
+    lastHeartbeatTime = now;
   }
 }

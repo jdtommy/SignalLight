@@ -2,6 +2,7 @@ package hotkey
 
 import (
 	"fmt"
+	"log"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -68,6 +69,12 @@ func (l *Listener) Start() error {
 	ready := make(chan error, 1)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Hotkey] Recovered from hotkey panic: %v", r)
+			}
+		}()
+
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
