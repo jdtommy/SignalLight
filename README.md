@@ -154,12 +154,13 @@ go run .
 Or simply double-click [`windows/run.bat`](file:///C:/Users/jdtom/dev/SignalLight/windows/run.bat) or run [`windows/run.ps1`](file:///C:/Users/jdtom/dev/SignalLight/windows/run.ps1).
 
 #### Method 2: Using the Pre-compiled Binary
+Download the signed `signallight.exe` from the [latest GitHub Release](https://github.com/jdtommy/SignalLight/releases/latest), or build your own from source:
 ```powershell
 cd C:\Users\jdtom\dev\SignalLight\windows
 .\signallight.exe
 ```
 > [!NOTE]
-> On Windows 11 systems with **Smart App Control (SAC)** enabled, unsigned standalone `.exe` binaries may be blocked by policy. Running via `go run .` is recommended for local development until an official code-signing certificate is integrated into the build pipeline (see Roadmap below).
+> Binaries attached to GitHub Releases are signed with a publicly-trusted Authenticode certificate (via Azure Trusted Signing), so Windows 11 **Smart App Control (SAC)** should allow them without a warning. A binary you compile yourself locally (`go build`/`go run`) is **not** signed — signing requires a live call to Azure with valid credentials — so SAC may still block a self-built `.exe`. If it does, run via `go run .` or download the signed release instead.
 
 #### Command Line Options
 | Flag | Default | Description |
@@ -173,7 +174,9 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 ---
 
 ## 📋 Future Roadmap & TODO
-- [ ] **Binary Code Signing & Packaging**: Setup Windows code-signing pipeline (trusted Authenticode certificate) or MSIX packaging so standalone `signallight.exe` executes seamlessly on Windows 11 systems with strict Smart App Control enabled.
+- [x] **Binary Code Signing**: `signallight.exe` attached to GitHub Releases is signed via [Azure Trusted Signing](https://azure.microsoft.com/en-us/products/artifact-signing) (Public Trust, individual developer), so it should run under Smart App Control without a warning.
+- [ ] **Automate release signing**: signing is currently a manual step (`sign code artifact-signing`, requires the maintainer's own `az login` session) run before uploading a release asset — move this into a CI/release pipeline so it isn't a manual, single-person-dependent step.
+- [ ] **MSIX Packaging**: consider MSIX packaging as an alternative/complementary distribution method.
 
 ---
 
