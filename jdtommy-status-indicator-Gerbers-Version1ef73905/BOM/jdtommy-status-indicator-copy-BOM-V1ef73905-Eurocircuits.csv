@@ -1,0 +1,6 @@
+﻿Reference designators,Quantity,MPN,Manufacturer,Part description,Value,SPN,Supplier,Package
+"CN1","1","B2B-XH-A(LF)(SN)","JST","Wire To Board / Wire To Wire Connector, CONN-TH_B2B-XH-A-LF-SN","","","","CONN-TH_B2B-XH-A-LF-SN"
+"CN2","1","B4B-XH-A(LF)(SN)","JST","Wire To Board / Wire To Wire Connector, CONN-TH_B4B-XH-A-LF-SN","","","","CONN-TH_B4B-XH-A-LF-SN"
+"Q4,Q5,Q6","3","MMBT3904LT1G","onsemi","Transistor","","","",""
+"R1,R2,R3,R4","4","1206","","Resistor, 1kΩ, SMD_1206_3216Metric","1kΩ","","",""
+"U2","1","ABX00083","Arduino","Development Board","","","",""

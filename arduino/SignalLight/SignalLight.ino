@@ -463,15 +463,21 @@ void loop() {
   BLE.poll();
 
   // 3. Restart advertising safely after disconnect (outside the callback)
-  if (needAdvertise && (now - disconnectTime >= 200)) {
+  // disconnectTime is set by blePeripheralDisconnectHandler during BLE.poll() just
+  // above, i.e. possibly later in this very iteration than the stale `now` above —
+  // use a fresh read so "now - disconnectTime" can't underflow (see step 9's comment).
+  if (needAdvertise && (millis() - disconnectTime >= 200)) {
     needAdvertise = false;
     Serial.println("[BLE] Resuming advertising...");
     BLE.advertise();
   }
 
   // 4. Security Timeout Check (disconnect central if it didn't authenticate in 4s)
+  // connectTime is set by blePeripheralConnectHandler during BLE.poll() just above,
+  // possibly later in this same iteration than the stale `now` — use a fresh read so
+  // this can't underflow and spuriously kick a central the instant it connects.
   if (isCentralConnected && isPaired && !isAuthenticated) {
-    if (now - connectTime > AUTH_TIMEOUT_MS) {
+    if (millis() - connectTime > AUTH_TIMEOUT_MS) {
       Serial.println("[Security] Auth timeout exceeded! Disconnecting central.");
       if (activeCentral && activeCentral.connected()) {
         activeCentral.disconnect();
@@ -516,10 +522,24 @@ void loop() {
   }
 
   // 9. Failsafe Watchdog & Disconnect Timeout
+  //
+  // Use a freshly-read timestamp here rather than the `now` snapshot taken at the top
+  // of loop(), instead of just relying on it like the other checks above. lastHeartbeatTime
+  // can be updated by step 6 (processControlCommand, via a fresh millis() call) LATER in
+  // this same iteration than when `now` was captured. Since these are unsigned long, if
+  // that later update ends up numerically greater than the stale `now` (which happens
+  // whenever BLE.poll() or anything else above takes even 1ms), "now - lastHeartbeatTime"
+  // underflows and wraps around to a huge value — far past HEARTBEAT_TIMEOUT_MS — causing
+  // an immediate, spurious YELLOW revert in the very same instant a command was just
+  // successfully received. This was a real, observed bug: the watchdog log line and the
+  // "[Control] Received..." log line for the command that supposedly timed out would show
+  // the identical millisecond timestamp. A fresh read here guarantees it's never earlier
+  // than any update lastHeartbeatTime/disconnectTime could have received this iteration.
   if (isPaired) {
+    unsigned long watchdogNow = millis();
     if (isCentralConnected) {
       // While connected: timeout if no heartbeat received for 60s
-      if (now - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
+      if (watchdogNow - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
         if (displayedColor != 'Y') {
           Serial.println("[Watchdog] Heartbeat timeout while connected. Reverting to YELLOW.");
           applyColor('Y');
@@ -527,7 +547,7 @@ void loop() {
       }
     } else {
       // While disconnected: hold previous color for DISCONNECT_GRACE_MS (45s), then turn Yellow
-      if (now - disconnectTime > DISCONNECT_GRACE_MS) {
+      if (watchdogNow - disconnectTime > DISCONNECT_GRACE_MS) {
         if (displayedColor != 'Y') {
           Serial.println("[Watchdog] Disconnect grace period expired. Reverting to YELLOW.");
           applyColor('Y');

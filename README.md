@@ -44,6 +44,27 @@ To keep Yellow ON when the Arduino is disconnected or powered off:
 - Place a **10kΩ pull-up resistor** between the **Gate (G)** of the Yellow MOSFET and the **3.3V** rail (or 5V rail if isolated from the GPIO pin by a resistor).
 - When the Arduino boots, the firmware immediately drives D3 HIGH and D2/D4 LOW.
 
+### 🖨️ Custom Driver PCB
+[`jdtommy-status-indicator.edif`](file:///C:/Users/jdtom/dev/SignalLight/jdtommy-status-indicator.edif) (netlist), [`status-indicator-dxf/`](file:///C:/Users/jdtom/dev/SignalLight/status-indicator-dxf) / [`status-indicator-svg/`](file:///C:/Users/jdtom/dev/SignalLight/status-indicator-svg) (plot previews), and [`jdtommy-status-indicator-Gerbers-Version1ef73905/`](file:///C:/Users/jdtom/dev/SignalLight/jdtommy-status-indicator-Gerbers-Version1ef73905) (fab package) are a small 2-layer PCB export (from [Flux](https://flux.ai)) that replaces the breadboard wiring above with a real board. It mounts an Arduino Nano ESP32 and drives the three LED channels through three `2N3904`-family NPN transistors (instead of the MOSFETs described above — a valid alternative for a modest LED current draw) as low-side switches, with the same Yellow-defaults-on pull-up resistor design:
+
+| Connector | Pin | Signal |
+|-----------|-----|--------|
+| **CN1** (2-pin, power in) | 1 | GND |
+| | 2 | +12V |
+| **CN2** (4-pin, LED out) | 1 | +12V (common anode) |
+| | 2 | Red cathode (via Q4, driven by D2, R2 = 1kΩ base resistor) |
+| | 3 | Yellow cathode (via Q5, driven by D3, R3 = 1kΩ base resistor, **R1 = 10kΩ pull-up to 3.3V**) |
+| | 4 | Green cathode (via Q6, driven by D4, R4 = 1kΩ base resistor) |
+
+Board outline is roughly **19mm × 45mm**.
+
+> [!NOTE]
+> **Bare PCB fabrication: ready to order.** `jdtommy-status-indicator-Gerbers-Version1ef73905/` has properly formatted Gerber X2 files for all layers, a real Excellon drill file, and an IPC-D-356 bare-board test netlist — this is a standard fab package any house (JLCPCB, PCBWay, OSH Park, etc.) should accept directly. (The DXF/SVG folders are just plot previews from an earlier export and aren't needed for ordering.)
+>
+> **Turnkey SMD assembly: not ready — fix the BOM first.** Every vendor BOM CSV in `BOM/` groups R1–R4 into a single line item labeled "1kΩ" (Flux's exporter grouped them by shared footprint and lost the distinct value). The correct values — confirmed in `pick_and_place.csv` — are **R1 = 10kΩ**, **R2/R3/R4 = 1kΩ**. If you submit a BOM as-is, R1 (the Yellow failsafe pull-up) would get placed as 1kΩ instead of 10kΩ: Yellow would still default on, just with ~10x more continuous current through that pull-up than intended. Split R1 into its own line before ordering assembly.
+>
+> Also note: **U2 (the Arduino Nano ESP32) can't be placed by any SMT line** — it's a whole dev board, not a stocked part, so it needs to be hand-soldered/socketed on regardless of which assembly path you use. The two JST connectors (CN1/CN2) do have real LCSC part numbers (`C158012`, `C144395`) if you want an assembly house to place those.
+
 ---
 
 ## 📁 Project Structure
@@ -54,7 +75,7 @@ SignalLight/
 │   ├── SignalLight/
 │   │   └── SignalLight.ino      # Arduino C++ sketch (BLE + Serial + Failsafe)
 │   └── micropython/
-│       └── main.py              # MicroPython equivalent
+│       └── main.py              # MicroPython equivalent (deprecated, see below)
 ├── windows/
 │   ├── ble/                     # Bluetooth Low Energy (BLE) client
 │   ├── hotkey/                  # Global Windows hotkeys (Ctrl+Shift+R/Y/G/A)
@@ -65,6 +86,10 @@ SignalLight/
 │   ├── go.mod / go.sum
 │   ├── main.go                  # Windows application entry point
 │   └── signallight.exe          # Compiled standalone Windows executable
+├── jdtommy-status-indicator.edif              # Driver PCB netlist (see Custom Driver PCB above)
+├── status-indicator-dxf/                      # Driver PCB plot previews (DXF, not needed for ordering)
+├── status-indicator-svg/                      # Driver PCB plot previews (SVG, not needed for ordering)
+├── jdtommy-status-indicator-Gerbers-Version1ef73905/   # Driver PCB fab package: Gerbers, drill file, BOMs, pick-and-place (see above)
 └── README.md
 ```
 
@@ -161,3 +186,8 @@ The local desktop detector works without any setup. If you also want cloud-level
    ```powershell
    .\signallight.exe -zoom-secret="YOUR_ZOOM_SECRET_TOKEN"
    ```
+
+---
+
+## 📄 License
+MIT — see [LICENSE](file:///C:/Users/jdtom/dev/SignalLight/LICENSE).

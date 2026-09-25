@@ -483,11 +483,21 @@ func (c *Client) lifecycleLoop() {
 			continue
 		}
 
-		// Windows WinRT settling delay after connection before discovering services
-		time.Sleep(350 * time.Millisecond)
-
-		// Verify connection is alive before discovering services
-		conn, cErr := device.Connected()
+		// Windows WinRT settling delay after connection before discovering services.
+		// Verify connection is alive before discovering services: device.Connected()
+		// has been observed to still report false for a bit even when the Arduino's
+		// own serial log confirms the connection genuinely succeeded, so a single
+		// check right after one settle delay was giving up on good connections too
+		// early. Poll a few times before concluding it really didn't come up.
+		var conn bool
+		var cErr error
+		for attempt := 0; attempt < 4; attempt++ {
+			time.Sleep(350 * time.Millisecond)
+			conn, cErr = device.Connected()
+			if cErr == nil && conn {
+				break
+			}
+		}
 		if cErr != nil || !conn {
 			log.Printf("[BLE] Device link not established (conn=%v, err=%v). Retrying in 2s...", conn, cErr)
 			_ = device.Disconnect()
@@ -509,7 +519,7 @@ func (c *Client) lifecycleLoop() {
 			statusBuf := make([]byte, 32)
 			if n, rErr := authChar.Read(statusBuf); rErr == nil {
 				statusStr := string(statusBuf[:n])
-				if strings.Contains(statusStr, "UNPAIRED") {
+				if strings.Contains(statusStr, "UNPAIRED") && c.confirmUnpaired(authChar) {
 					log.Println("[BLE] Connected device reported STATUS:UNPAIRED (hardware reset detected)! Clearing saved pairing.")
 					_ = device.Disconnect()
 					c.SetTarget("", "", "")
@@ -549,7 +559,7 @@ func (c *Client) lifecycleLoop() {
 				continue
 			}
 			respStr := string(respBuf[:n])
-			if strings.Contains(respStr, "NOT_PAIRED") || strings.Contains(respStr, "UNPAIRED") {
+			if (strings.Contains(respStr, "NOT_PAIRED") || strings.Contains(respStr, "UNPAIRED")) && c.confirmUnpaired(authChar) {
 				log.Println("[BLE] Device is in factory UNPAIRED mode (hardware reset detected)! Clearing saved pairing.")
 				_ = device.Disconnect()
 				c.SetTarget("", "", "")
@@ -670,25 +680,20 @@ func (c *Client) scanForTarget(targetMAC, targetName string) (*bluetooth.ScanRes
 		addr := strings.ToUpper(result.Address.String())
 		name := strings.TrimSpace(result.LocalName())
 
-		// 1. MAC match takes highest priority
+		// 1. MAC match takes highest priority.
+		//
+		// This used to also compare the scanned advertisement's LocalName against the
+		// expected paired name, and wipe the saved pairing if it looked like a factory
+		// default ("SignalLight-XXXX"). That's a real, observed false-positive risk:
+		// Windows' own BLE scan/device cache can serve a STALE advertised name for a MAC
+		// address (commonly the very first name it ever saw the device advertise under,
+		// e.g. before it was paired), even though the device is actually advertising
+		// correctly over the air. That silently wiped a real, still-paired device's config
+		// with no way to undo it. A genuine factory reset is still reliably detected right
+		// after connecting via discoverCharacteristics + the STATUS/AUTH read below, which
+		// forces an uncached GATT read of the actual device instead of trusting scan data.
 		if targetMAC != "" {
 			if addr == targetMAC {
-				// If we expected a paired friendly name (e.g. "Jarads"), but the device is now
-				// advertising with the factory unpaired default name ("SignalLight-XXXX"):
-				// A hardware factory reset was performed on the device!
-				if targetName != "" && !strings.EqualFold(name, targetName) && strings.HasPrefix(strings.ToLower(name), "signallight-") {
-					log.Printf("[BLE] Target device %s has reverted to factory unpaired name ('%s')! Clearing pairing.", addr, name)
-					c.SetTarget("", "", "")
-					c.mu.Lock()
-					unpairedCb := c.onUnpaired
-					c.mu.Unlock()
-					if unpairedCb != nil {
-						unpairedCb()
-					}
-					_ = adapter.StopScan()
-					return
-				}
-
 				foundResult = &result
 				_ = adapter.StopScan()
 				return
@@ -760,6 +765,30 @@ func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar *b
 	return nil, nil, err
 }
 
+// confirmUnpaired re-queries the device's pairing status directly ("STATUS?") as a
+// second, independent check before an "unpaired" signal is trusted enough to wipe the
+// local config. This link has been directly observed to corrupt GATT read payloads
+// under degraded conditions (e.g. a garbled device name during a bad reconnect
+// storm), and the unpair-detection checks below only do a loose substring match —
+// a single corrupted read that happens to contain "UNPAIRED" as noise could
+// otherwise destroy a real, still-valid pairing with no way to undo it. Requiring an
+// independent re-read to agree makes that far less likely.
+func (c *Client) confirmUnpaired(authChar *bluetooth.DeviceCharacteristic) bool {
+	if authChar == nil {
+		return false
+	}
+	if _, err := authChar.Write([]byte("STATUS?")); err != nil {
+		return false
+	}
+	time.Sleep(150 * time.Millisecond)
+	buf := make([]byte, 32)
+	n, err := authChar.Read(buf)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(buf[:n])) == "STATUS:UNPAIRED"
+}
+
 // writePing sends 'P' using Write with response (acknowledged).
 // We strictly do NOT fall back to WriteWithoutResponse here, because WriteWithoutResponse
 // succeeds in Windows WinRT even when the peripheral is completely disconnected!
@@ -778,8 +807,20 @@ func (c *Client) writePing(char *bluetooth.DeviceCharacteristic) (err error) {
 	return err
 }
 
-// writeControl sends a control command byte ('R', 'Y', 'G', '0').
-// Tries Write with response first; if that fails, checks OS connection and tries WriteWithoutResponse.
+// writeControl sends a control command byte ('R', 'Y', 'G', '0') using Write with
+// response (acknowledged).
+//
+// This used to fall back to WriteWithoutResponse whenever device.Connected() didn't
+// clearly report "disconnected" (including when Connected() itself errored). That
+// fallback silently masked real failures: WriteWithoutResponse reports success in
+// Windows WinRT even when the peripheral is completely disconnected (see writePing's
+// comment above), and a stale/closed WinRT BLE object — a real, observed failure mode
+// (HRESULT 0x80000013 "The object has been closed" / RO_E_CLOSED) — can make both the
+// initial Write AND device.Connected() unreliable at the same time. The result was up
+// to 60 seconds of heartbeats silently going nowhere before the Arduino's own watchdog
+// gave up and reverted to Yellow, instead of a fast, honest reconnect. We now always
+// surface a Write failure as a real error so the caller disconnects and reconnects
+// immediately (which typically completes in a few seconds), the same way writePing does.
 func (c *Client) writeControl(char *bluetooth.DeviceCharacteristic, cmd byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -792,44 +833,6 @@ func (c *Client) writeControl(char *bluetooth.DeviceCharacteristic, cmd byte) (e
 	}
 
 	_, err = char.Write([]byte{cmd})
-	if err == nil {
-		return nil
-	}
-
-	// If Write failed, check if device is disconnected
-	c.mu.Lock()
-	dev := c.device
-	c.mu.Unlock()
-	if dev != nil {
-		if conn, cErr := dev.Connected(); cErr == nil && !conn {
-			return fmt.Errorf("device is disconnected: %w", err)
-		}
-	}
-
-	_, err = char.WriteWithoutResponse([]byte{cmd})
-	return err
-}
-
-func (c *Client) writeChar(char *bluetooth.DeviceCharacteristic, data []byte) (err error) {
-	if len(data) == 1 && data[0] == 'P' {
-		return c.writePing(char)
-	}
-	if len(data) == 1 {
-		return c.writeControl(char, data[0])
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("recovered from writeChar panic: %v", r)
-		}
-	}()
-
-	if char == nil {
-		return errors.New("characteristic is nil")
-	}
-	_, err = char.Write(data)
-	if err != nil {
-		_, err = char.WriteWithoutResponse(data)
-	}
 	return err
 }
 
@@ -844,6 +847,7 @@ func (c *Client) connectionLoop(device *bluetooth.Device, char *bluetooth.Device
 	defer heartbeat.Stop()
 
 	heartbeatCounter := 0
+	mismatchStreak := 0
 
 	for {
 		select {
@@ -876,6 +880,44 @@ func (c *Client) connectionLoop(device *bluetooth.Device, char *bluetooth.Device
 			if err != nil {
 				log.Printf("[BLE] Heartbeat error: %v. Connection lost.", err)
 				return
+			}
+
+			// 3. Verify the write actually reached the device instead of blindly
+			// trusting Write()'s success. This is a real, observed failure mode on
+			// some BLE link/driver conditions: Write-with-response can report success
+			// at the host/WinRT layer without the peripheral ever receiving the byte,
+			// with no error surfaced anywhere — confirmed independent of USB/RF
+			// proximity (reproduced even with the Arduino on separate power, 7ft
+			// away). Reading the characteristic back (forced uncached, so it reflects
+			// a real over-the-air round trip) after a short settle delay lets us
+			// detect this and retry the write immediately.
+			//
+			// NOTE: an earlier version of this forced a full disconnect+reconnect
+			// after a sustained mismatch. In practice that made recovery WORSE: it
+			// exposed a separate, pre-existing bug where a fresh reconnect's own
+			// device.Connected() check can unreliably report false even when the
+			// Arduino confirms a real connection, turning a bounded ~60s Yellow
+			// (the Arduino's own watchdog self-healing once a write finally gets
+			// through) into an open-ended multi-minute outage stuck retrying a bad
+			// reconnect path. So we now only ever retry the write on the SAME
+			// still-alive connection here, and leave reconnect decisions entirely to
+			// real OS-level signals (Connected()/Write()/Read() actually erroring).
+			time.Sleep(150 * time.Millisecond)
+			readBuf := make([]byte, 1)
+			n, rErr := char.Read(readBuf)
+			if rErr != nil {
+				log.Printf("[BLE] Heartbeat verify-read error: %v. Connection lost.", rErr)
+				return
+			}
+			if n < 1 || readBuf[0] != activeColor {
+				mismatchStreak++
+				log.Printf("[BLE] Heartbeat verify mismatch (device reports '%c', expected '%c'), streak=%d. Retrying write...", readBuf[0], activeColor, mismatchStreak)
+				if retryErr := c.writeControl(char, activeColor); retryErr != nil {
+					log.Printf("[BLE] Heartbeat retry write error: %v. Connection lost.", retryErr)
+					return
+				}
+			} else {
+				mismatchStreak = 0
 			}
 
 			heartbeatCounter++

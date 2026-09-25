@@ -1,0 +1,11 @@
+﻿Designator,Mid X,Mid Y,Layer,Rotation,Package,Value
+"CN1","13.9975mm","15.56mm","Top",270,"CONN-TH_B2B-XH-A-LF-SN",""
+"CN2","-13.4623mm","15.58mm","Top",90,"CONN-TH_B4B-XH-A-LF-SN",""
+"Q4","-14.4123mm","4.1113mm","Top",90,"",""
+"Q5","-14.4123mm","-5.8111mm","Top",90,"",""
+"Q6","-14.4123mm","-15.15mm","Top",90,"",""
+"R1","2.1329mm","4.17mm","Top",0,"SMD_1206_3216Metric","10kΩ"
+"R2","-15.3623mm","-0.3887mm","Top",90,"SMD_1206_3216Metric","1kΩ"
+"R3","-15.3623mm","-10.3111mm","Top",90,"SMD_1206_3216Metric","1kΩ"
+"R4","-15.3623mm","-19.65mm","Top",90,"SMD_1206_3216Metric","1kΩ"
+"U2","2.1326mm","-0.9099mm","Top",90,"",""

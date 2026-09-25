@@ -1,0 +1,6 @@
+﻿Item #,Designator,Qty,Manufacturer,Mfg Part #,Description / Value,Package/Footprint,Type,Your Instructions / Notes
+"1","CN1","1","JST","B2B-XH-A(LF)(SN)","Wire To Board / Wire To Wire Connector, CONN-TH_B2B-XH-A-LF-SN","CONN-TH_B2B-XH-A-LF-SN","",""
+"2","CN2","1","JST","B4B-XH-A(LF)(SN)","Wire To Board / Wire To Wire Connector, CONN-TH_B4B-XH-A-LF-SN","CONN-TH_B4B-XH-A-LF-SN","",""
+"3","Q4,Q5,Q6","3","onsemi","MMBT3904LT1G","Transistor","","",""
+"4","R1,R2,R3,R4","4","","1206","Resistor, 1kΩ, SMD_1206_3216Metric","","",""
+"5","U2","1","Arduino","ABX00083","Development Board","","",""
