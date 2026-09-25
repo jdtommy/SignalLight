@@ -190,4 +190,8 @@ The local desktop detector works without any setup. If you also want cloud-level
 ---
 
 ## 📄 License
-MIT — see [LICENSE](file:///C:/Users/jdtom/dev/SignalLight/LICENSE).
+MIT — see [LICENSE](LICENSE).
+
+## 🔒 Privacy & Code Signing
+- [Privacy Policy](PRIVACY.md) — SignalLight collects no data; everything runs locally.
+- [Code Signing Policy](CODE_SIGNING_POLICY.md) — official repository, signed artifacts, and release process.
