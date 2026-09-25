@@ -1,13 +1,17 @@
 package config
 
 import (
-	"os"
 	"testing"
 )
 
 func TestConfigSaveLoadClear(t *testing.T) {
-	tmpFile := "test_config.json"
-	defer os.Remove(tmpFile)
+	// GetConfigPath() resolves to a local ./config.json (if present) or
+	// %APPDATA%\SignalLight\config.json — neither of which Save/Load let us override
+	// directly. Redirect both by running in an isolated temp dir with APPDATA pointed
+	// there too, so this test can't read or clobber a real, already-paired device's config.
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 
 	testCfg := &Config{
 		TargetMAC:    "AA:BB:CC:DD:EE:FF",

@@ -10,14 +10,16 @@ import (
 )
 
 var (
-	user32                       = syscall.NewLazyDLL("user32.dll")
-	procOpenDesktopW             = user32.NewProc("OpenDesktopW")
-	procCloseDesktop             = user32.NewProc("CloseDesktop")
-	procEnumDesktopWindows       = user32.NewProc("EnumDesktopWindows")
-	procGetWindowTextW           = user32.NewProc("GetWindowTextW")
-	procGetClassNameW            = user32.NewProc("GetClassNameW")
-	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
-	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	user32                         = syscall.NewLazyDLL("user32.dll")
+	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
+	procOpenDesktopW               = user32.NewProc("OpenDesktopW")
+	procCloseDesktop               = user32.NewProc("CloseDesktop")
+	procEnumDesktopWindows         = user32.NewProc("EnumDesktopWindows")
+	procGetWindowTextW             = user32.NewProc("GetWindowTextW")
+	procGetClassNameW              = user32.NewProc("GetClassNameW")
+	procIsWindowVisible            = user32.NewProc("IsWindowVisible")
+	procGetWindowThreadProcessId   = user32.NewProc("GetWindowThreadProcessId")
+	procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
 
 	defaultDesktop, _ = syscall.UTF16PtrFromString("Default")
 	enumDesktopCb     = syscall.NewCallback(enumDesktopProc)
@@ -25,8 +27,9 @@ var (
 )
 
 const (
-	DESKTOP_READOBJECTS = 0x0001
-	DESKTOP_ENUMERATE   = 0x0040
+	DESKTOP_READOBJECTS                      = 0x0001
+	DESKTOP_ENUMERATE                        = 0x0040
+	PROCESS_QUERY_LIMITED_INFORMATION uint32 = 0x1000
 )
 
 type enumContext struct {
@@ -58,28 +61,76 @@ func enumDesktopProc(hwnd uintptr, lparam uintptr) uintptr {
 	procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&bTitle[0])), 256)
 	title := syscall.UTF16ToString(bTitle[:])
 
-	lowerClass := strings.ToLower(className)
-	lowerTitle := strings.ToLower(title)
-
-	// 1. Zoom Presentation Content View Window (main in-meeting video window)
-	if lowerClass == "zpcontentviewwnd" {
+	// Heuristics 1 & 2: Zoom's own window classes are specific enough that no
+	// process-identity check is needed.
+	if isZoomVideoWindow(className, title) {
 		ctx.meetingFound = true
 		return 0 // Stop enum
 	}
 
-	// 2. Zoom Floating Video Window when multitasking / minimized during a meeting
-	if lowerClass == "zpfloatvideowndclass" && (strings.Contains(lowerTitle, "zoom") || lowerTitle == "zfloatsizableparentwndcls") {
-		ctx.meetingFound = true
-		return 0
-	}
-
-	// 3. Window title explicitly indicates active meeting/webinar
-	if strings.Contains(lowerTitle, "zoom meeting") || strings.Contains(lowerTitle, "zoom webinar") {
+	// Heuristic 3: title-only match is weak (any app — a browser tab, a calendar
+	// invite, a doc titled "How to join a Zoom meeting" — could coincidentally
+	// contain this text), so also confirm the window actually belongs to Zoom's
+	// own process before trusting it.
+	if titleLooksLikeZoomMeeting(title) && processNameForWindow(hwnd) == "zoom.exe" {
 		ctx.meetingFound = true
 		return 0
 	}
 
 	return 1
+}
+
+// isZoomVideoWindow reports whether className/title match one of Zoom's own window
+// classes for an active meeting (ZPContentViewWnd, ZPFloatVideoWndClass).
+func isZoomVideoWindow(className, title string) bool {
+	lowerClass := strings.ToLower(className)
+	lowerTitle := strings.ToLower(title)
+
+	if lowerClass == "zpcontentviewwnd" {
+		return true
+	}
+	if lowerClass == "zpfloatvideowndclass" && (strings.Contains(lowerTitle, "zoom") || lowerTitle == "zfloatsizableparentwndcls") {
+		return true
+	}
+	return false
+}
+
+// titleLooksLikeZoomMeeting reports whether a window title alone suggests an active
+// Zoom meeting/webinar. Callers MUST additionally verify the window's owning process
+// (see processNameForWindow) before treating this as a real match.
+func titleLooksLikeZoomMeeting(title string) bool {
+	lowerTitle := strings.ToLower(title)
+	return strings.Contains(lowerTitle, "zoom meeting") || strings.Contains(lowerTitle, "zoom webinar")
+}
+
+// processNameForWindow returns the lowercase base executable name (e.g. "zoom.exe")
+// of the process that owns hwnd, or "" if it can't be determined.
+func processNameForWindow(hwnd uintptr) string {
+	var pid uint32
+	procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	if pid == 0 {
+		return ""
+	}
+
+	handle, err := syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return ""
+	}
+	defer syscall.CloseHandle(handle)
+
+	var buf [syscall.MAX_PATH]uint16
+	size := uint32(len(buf))
+	ret, _, _ := procQueryFullProcessImageNameW.Call(uintptr(handle), 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)))
+	if ret == 0 {
+		return ""
+	}
+
+	fullPath := syscall.UTF16ToString(buf[:size])
+	name := fullPath
+	if idx := strings.LastIndexAny(fullPath, `\/`); idx >= 0 {
+		name = fullPath[idx+1:]
+	}
+	return strings.ToLower(name)
 }
 
 // MeetingDetector polls the system to detect if Zoom is in an active meeting.
@@ -88,6 +139,7 @@ type MeetingDetector struct {
 	inMeeting    bool
 	onChange     func(inMeeting bool)
 	stopChan     chan struct{}
+	panicCount   int
 }
 
 // NewDetector creates a new Zoom meeting detector.
@@ -105,10 +157,21 @@ func NewDetector(interval time.Duration, onChange func(inMeeting bool)) *Meeting
 // Start begins polling for Zoom meeting status.
 func (d *MeetingDetector) Start() {
 	go func() {
+		runStart := time.Now()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[Zoom] Recovered from detector panic: %v. Restarting...", r)
-				time.Sleep(2 * time.Second)
+				// Reset the streak after a sustained healthy run so one rare
+				// panic doesn't count against a genuinely recurring crash-loop.
+				if time.Since(runStart) > 30*time.Second {
+					d.panicCount = 0
+				}
+				d.panicCount++
+				backoff := time.Duration(d.panicCount) * 2 * time.Second
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
+				log.Printf("[Zoom] Recovered from detector panic (#%d): %v. Restarting in %v...", d.panicCount, r, backoff)
+				time.Sleep(backoff)
 				d.Start()
 			}
 		}()

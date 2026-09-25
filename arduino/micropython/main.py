@@ -1,6 +1,14 @@
 """
 SignalLight - MicroPython for Arduino Nano ESP32 (ESP32-S3)
 
+*** DEPRECATED / NOT MAINTAINED ***
+This file only implements the Control characteristic (19B10001). It has no Auth
+characteristic (19B10002) at all, so it cannot complete the PAIR/AUTH handshake the
+current Windows companion app and Arduino .ino firmware use (see ARCHITECTURE.md).
+Pairing from the Windows app's web dashboard will not work against this firmware.
+It is kept only as a reference for a from-scratch MicroPython port and is not a
+supported alternative to arduino/SignalLight/SignalLight.ino.
+
 Hardware:
   - D2 (GPIO 5): RED LED
   - D3 (GPIO 6): YELLOW LED (Default ON)

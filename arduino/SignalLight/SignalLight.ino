@@ -49,10 +49,14 @@ bool isAuthenticated = false;
 unsigned long connectTime = 0;
 const unsigned long AUTH_TIMEOUT_MS = 4000;
 
-// Watchdog timer (15 seconds)
-const unsigned long HEARTBEAT_TIMEOUT_MS = 15000;
+// Watchdog & Disconnect Timers
+const unsigned long HEARTBEAT_TIMEOUT_MS = 60000; // 60s timeout while connected
+const unsigned long DISCONNECT_GRACE_MS   = 45000; // 45s grace period on disconnect before turning Yellow
+const unsigned long PULSE_CYCLE_MS  = 1000; // Period of the unpaired "awaiting pairing" pulse
+const unsigned long PULSE_ON_MS     = 700;  // How much of each cycle the pulse stays lit
 unsigned long lastHeartbeatTime = 0;
-char currentColor = 'Y';
+char activeColor = 'G';     // The desired operational color (survives disconnects)
+char displayedColor = ' ';  // The actual color currently illuminated on the LEDs
 
 // Double-press reset detection via flash (survives power cycles and EN pin reset)
 unsigned long bootTime = 0;
@@ -83,7 +87,10 @@ void flashLED(int pin, int times, int delayMs) {
 }
 
 void applyColor(char c) {
-  currentColor = c;
+  if (displayedColor == c) {
+    return; // Already showing this color; prevent flicker, flash wear, and log spam
+  }
+  displayedColor = c;
   
   digitalWrite(PIN_RED, LOW);
   digitalWrite(PIN_YELLOW, LOW);
@@ -104,8 +111,8 @@ void applyColor(char c) {
     default:
       digitalWrite(PIN_YELLOW, HIGH);
       setOnboardRGB(true, true, false);  // Onboard YELLOW (Red + Green)
-      Serial.println("[State] -> YELLOW (Away / Default)");
-      currentColor = 'Y';
+      Serial.println("[State] -> YELLOW (Away / Disconnected)");
+      displayedColor = 'Y';
       break;
     case '0':
       setOnboardRGB(false, false, false); // All OFF
@@ -113,7 +120,26 @@ void applyColor(char c) {
       break;
   }
 
-  lightCharacteristic.writeValue((byte)currentColor);
+  lightCharacteristic.writeValue((byte)displayedColor);
+}
+
+void setActiveColor(char c) {
+  c = toupper(c);
+  if (c != 'R' && c != 'G' && c != 'Y' && c != '0') {
+    return;
+  }
+  activeColor = c;
+
+  // Persist active color so reboots/brownouts hold the same state seamlessly
+  if (isPaired) {
+    prefs.begin("signallight", false);
+    if (prefs.getChar("active_color", ' ') != activeColor) {
+      prefs.putChar("active_color", activeColor);
+    }
+    prefs.end();
+  }
+
+  applyColor(activeColor);
 }
 
 void factoryReset() {
@@ -145,27 +171,45 @@ void processControlCommand(char cmd) {
 
   switch (cmd) {
     case 'R':
-      applyColor('R');
-      break;
     case 'Y':
-      applyColor('Y');
-      break;
     case 'G':
-      applyColor('G');
-      break;
     case '0':
-      applyColor('0');
+      // Explicit log of the raw command + its source: helps distinguish an
+      // intentional color change (hotkey/dashboard/heartbeat resync) from the
+      // watchdog's own distinct "[Watchdog] ... Reverting to YELLOW" log lines below.
+      Serial.print("[Control] Received explicit command from host: ");
+      Serial.println(cmd);
+      setActiveColor(cmd);
       break;
     case 'P':
-      // Heartbeat ping
+      // Heartbeat ping: If previously fallen back to Yellow due to disconnect/watchdog, restore activeColor
+      if (displayedColor != activeColor) {
+        applyColor(activeColor);
+      }
       break;
     case '?':
       Serial.print("STATUS:");
-      Serial.println(currentColor);
+      Serial.println(displayedColor);
       break;
     default:
       break;
   }
+}
+
+// constantTimeEquals compares two secrets without an early exit on the first mismatched
+// byte, so a BLE-adjacent attacker can't use response timing to narrow down the secret
+// one byte at a time. (String::equals() is not guaranteed to have this property.)
+bool constantTimeEquals(const String &a, const String &b) {
+  size_t lenA = a.length();
+  size_t lenB = b.length();
+  size_t maxLen = lenA > lenB ? lenA : lenB;
+  uint8_t diff = (lenA != lenB) ? 1 : 0;
+  for (size_t i = 0; i < maxLen; i++) {
+    char ca = (i < lenA) ? a[i] : 0;
+    char cb = (i < lenB) ? b[i] : 0;
+    diff |= (uint8_t)(ca ^ cb);
+  }
+  return diff == 0;
 }
 
 void processAuthMessage(String msg) {
@@ -175,7 +219,11 @@ void processAuthMessage(String msg) {
 
   // 1. Initial Pairing: "PAIR:<name>:<secret>"
   if (msg.startsWith("PAIR:")) {
-    if (isPaired && !isAuthenticated) {
+    // PAIR: is only valid in factory-unpaired mode. Previously this only blocked
+    // re-pairing while unauthenticated, which meant an already-authenticated central
+    // could silently overwrite the stored name/secret with no confirmation step.
+    // Re-pairing now always requires an explicit UNPAIR (factory reset) first.
+    if (isPaired) {
       authCharacteristic.writeValue("ERR:ALREADY_PAIRED");
       return;
     }
@@ -203,12 +251,14 @@ void processAuthMessage(String msg) {
     prefs.putString("name", newName);
     prefs.putString("secret", newSecret);
     prefs.putBool("rst_armed", false);
+    prefs.putChar("active_color", 'G');
     prefs.end();
 
     isPaired = true;
     deviceName = newName;
     sharedSecret = newSecret;
     isAuthenticated = true;
+    activeColor = 'G';
 
     authCharacteristic.writeValue("PAIR_OK");
     Serial.print("[Auth] Paired as '");
@@ -217,7 +267,7 @@ void processAuthMessage(String msg) {
 
     digitalWrite(PIN_YELLOW, LOW);
     flashLED(PIN_GREEN, 3, 150);
-    applyColor(currentColor);
+    applyColor(activeColor);
     return;
   }
 
@@ -232,11 +282,11 @@ void processAuthMessage(String msg) {
     String incomingSecret = msg.substring(5);
     incomingSecret.trim();
 
-    if (incomingSecret.equals(sharedSecret)) {
+    if (constantTimeEquals(incomingSecret, sharedSecret)) {
       isAuthenticated = true;
       authCharacteristic.writeValue("AUTH_OK");
       Serial.println("[Auth] Authentication SUCCESS.");
-      applyColor(currentColor);
+      applyColor(activeColor);
     } else {
       authCharacteristic.writeValue("AUTH_FAIL");
       Serial.println("[Auth] Authentication FAILED! Disconnecting central.");
@@ -308,9 +358,6 @@ void setup() {
   pinMode(LED_BLUE, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  // Initial yellow state
-  applyColor('Y');
-
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=========================================");
@@ -353,7 +400,16 @@ void setup() {
   isPaired = prefs.getBool("paired", false);
   deviceName = prefs.getString("name", "");
   sharedSecret = prefs.getString("secret", "");
+  char savedColor = prefs.getChar("active_color", 'G');
   prefs.end();
+
+  // If already paired, restore the active color immediately so reboots don't cause a yellow glitch
+  if (isPaired && (savedColor == 'G' || savedColor == 'R' || savedColor == 'Y' || savedColor == '0')) {
+    activeColor = savedColor;
+    applyColor(activeColor);
+  } else {
+    applyColor('Y');
+  }
 
   String activeName = defaultName;
   if (isPaired && deviceName.length() > 0) {
@@ -377,7 +433,7 @@ void setup() {
     lightService.addCharacteristic(authCharacteristic);
     BLE.addService(lightService);
 
-    lightCharacteristic.writeValue((byte)currentColor);
+    lightCharacteristic.writeValue((byte)displayedColor);
     authCharacteristic.writeValue(isPaired ? "STATUS:PAIRED" : "STATUS:UNPAIRED");
 
     BLE.setEventHandler(BLEConnected, blePeripheralConnectHandler);
@@ -413,7 +469,7 @@ void loop() {
     BLE.advertise();
   }
 
-  // 5. Security Timeout Check
+  // 4. Security Timeout Check (disconnect central if it didn't authenticate in 4s)
   if (isCentralConnected && isPaired && !isAuthenticated) {
     if (now - connectTime > AUTH_TIMEOUT_MS) {
       Serial.println("[Security] Auth timeout exceeded! Disconnecting central.");
@@ -423,19 +479,19 @@ void loop() {
     }
   }
 
-  // 4. Handle Auth Characteristic
+  // 5. Handle Auth Characteristic
   if (authCharacteristic.written()) {
     String msg = authCharacteristic.value();
     processAuthMessage(msg);
   }
 
-  // 5. Handle Control Characteristic
+  // 6. Handle Control Characteristic
   if (lightCharacteristic.written()) {
     byte val = lightCharacteristic.value();
     processControlCommand((char)val);
   }
 
-  // 6. Handle USB Serial Commands
+  // 7. Handle USB Serial Commands
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
@@ -447,10 +503,10 @@ void loop() {
     }
   }
 
-  // 7. Visual Pulse when Unpaired and Awaiting Connection
+  // 8. Visual Pulse when Unpaired and Awaiting Connection
   if (!isPaired && !isCentralConnected) {
-    int cycle = now % 1000;
-    if (cycle < 700) {
+    unsigned long cycle = now % PULSE_CYCLE_MS;
+    if (cycle < PULSE_ON_MS) {
       digitalWrite(PIN_YELLOW, HIGH);
       setOnboardRGB(true, true, false); // Onboard Yellow (Red + Green)
     } else {
@@ -459,12 +515,24 @@ void loop() {
     }
   }
 
-  // 8. Failsafe Watchdog (revert to Yellow if connection lost)
-  if (isPaired && (now - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS)) {
-    if (currentColor != 'Y') {
-      Serial.println("[Watchdog] Heartbeat timeout. Reverting to YELLOW.");
-      applyColor('Y');
+  // 9. Failsafe Watchdog & Disconnect Timeout
+  if (isPaired) {
+    if (isCentralConnected) {
+      // While connected: timeout if no heartbeat received for 60s
+      if (now - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
+        if (displayedColor != 'Y') {
+          Serial.println("[Watchdog] Heartbeat timeout while connected. Reverting to YELLOW.");
+          applyColor('Y');
+        }
+      }
+    } else {
+      // While disconnected: hold previous color for DISCONNECT_GRACE_MS (45s), then turn Yellow
+      if (now - disconnectTime > DISCONNECT_GRACE_MS) {
+        if (displayedColor != 'Y') {
+          Serial.println("[Watchdog] Disconnect grace period expired. Reverting to YELLOW.");
+          applyColor('Y');
+        }
+      }
     }
-    lastHeartbeatTime = now;
   }
 }

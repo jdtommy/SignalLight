@@ -1,6 +1,7 @@
 package state
 
 import (
+	"log"
 	"sync"
 )
 
@@ -36,6 +37,7 @@ type Manager struct {
 	mode            Mode
 	lastManualColor LightColor
 	zoomMeeting     bool
+	zoomAway        bool
 	sessionLocked   bool
 	connected       bool
 	listeners       []Listener
@@ -70,7 +72,9 @@ func (m *Manager) notify() {
 		listener := fn
 		go func() {
 			defer func() {
-				_ = recover()
+				if r := recover(); r != nil {
+					log.Printf("[State] Recovered from listener panic: %v", r)
+				}
 			}()
 			listener(status)
 		}()
@@ -90,7 +94,7 @@ func (m *Manager) GetStatus() Status {
 }
 
 // evaluateAutoColor calculates the appropriate color in AUTO mode.
-// Priority: Disconnected (OFF) > Zoom Meeting (RED) > Screen Locked (YELLOW) > Available (GREEN)
+// Priority: Disconnected (OFF) > Zoom Meeting (RED) > Screen Locked / Zoom Away (YELLOW) > Available (GREEN)
 func (m *Manager) evaluateAutoColor() LightColor {
 	if !m.connected {
 		return ColorOff
@@ -98,7 +102,7 @@ func (m *Manager) evaluateAutoColor() LightColor {
 	if m.zoomMeeting {
 		return ColorRed
 	}
-	if m.sessionLocked {
+	if m.sessionLocked || m.zoomAway {
 		return ColorYellow
 	}
 	return ColorGreen
@@ -143,6 +147,20 @@ func (m *Manager) OnSessionLockChanged(locked bool) {
 	defer m.mu.Unlock()
 
 	m.sessionLocked = locked
+	if m.mode == ModeAuto {
+		m.color = m.evaluateAutoColor()
+		m.notify()
+	}
+}
+
+// OnZoomPresenceAway updates state when Zoom's cloud presence reports the user as away.
+// Unlike SetManualColor, this stays in AUTO mode so it doesn't permanently override
+// future Zoom meeting / screen lock detection once presence changes back.
+func (m *Manager) OnZoomPresenceAway(away bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.zoomAway = away
 	if m.mode == ModeAuto {
 		m.color = m.evaluateAutoColor()
 		m.notify()

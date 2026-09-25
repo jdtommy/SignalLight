@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -43,10 +44,23 @@ func NewServer(addr string, stateMgr *state.Manager, bleClient *ble.Client, zoom
 	}
 	s.routes()
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: recoveryMiddleware(s.mux),
+		Addr:              addr,
+		Handler:           recoveryMiddleware(s.mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	return s
+}
+
+// jsonError writes an error as valid JSON. Unlike hand-concatenating `{"error":"`+err.Error()+`"}`,
+// this can't produce invalid JSON when the underlying error message contains a quote,
+// backslash, or newline (plausible from BLE/library errors).
+func jsonError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
 func recoveryMiddleware(next http.Handler) http.Handler {
@@ -64,12 +78,36 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleDashboard)
 	s.mux.HandleFunc("/api/status", s.handleStatus)
-	s.mux.HandleFunc("/api/set", s.handleSet)
+	s.mux.HandleFunc("/api/set", sameOriginOnly(s.handleSet))
 	s.mux.HandleFunc("/api/ble/config", s.handleBLEConfig)
-	s.mux.HandleFunc("/api/ble/scan", s.handleBLEScan)
-	s.mux.HandleFunc("/api/ble/pair", s.handleBLEPair)
-	s.mux.HandleFunc("/api/ble/unpair", s.handleBLEUnpair)
+	s.mux.HandleFunc("/api/ble/scan", sameOriginOnly(s.handleBLEScan))
+	s.mux.HandleFunc("/api/ble/pair", sameOriginOnly(s.handleBLEPair))
+	s.mux.HandleFunc("/api/ble/unpair", sameOriginOnly(s.handleBLEUnpair))
 	s.mux.HandleFunc("/webhook/zoom", s.handleZoomWebhook)
+}
+
+// sameOriginOnly blocks cross-site browser requests (CSRF) to state-changing endpoints.
+// The dashboard is unauthenticated by design (trusted single-user localhost tool), so any
+// page a user's browser has open could otherwise silently POST/GET these endpoints and
+// change the light's color or unpair the hardware. A browser always sets Origin (or, on
+// older browsers, Referer) on cross-origin fetch/form requests; we require it to match
+// this server's own Host when present. Non-browser clients (curl, scripts) send neither
+// header and are allowed through, since they can't be coerced into a request by a webpage.
+func sameOriginOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = r.Header.Get("Referer")
+		}
+		if origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || !strings.EqualFold(u.Host, r.Host) {
+				http.Error(w, `{"error":"cross-origin request rejected"}`, http.StatusForbidden)
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) Start(listeners ...net.Listener) error {
@@ -106,6 +144,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	colorParam := strings.ToUpper(r.URL.Query().Get("color"))
 	if colorParam == "" {
 		_ = r.ParseForm()
@@ -157,7 +200,7 @@ func (s *Server) handleBLEScan(w http.ResponseWriter, r *http.Request) {
 
 	devices, err := s.bleClient.ScanNearbyDevices(6 * time.Second)
 	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -197,7 +240,7 @@ func (s *Server) handleBLEPair(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.bleClient.PairDevice(req.Address, req.Name, req.Secret); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -236,6 +279,30 @@ func (s *Server) handleBLEUnpair(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+// verifyZoomSignature validates Zoom's per-request HMAC (x-zm-signature /
+// x-zm-request-timestamp headers) per Zoom's webhook signing spec:
+// signature = "v0=" + hex(HMAC-SHA256("v0:{timestamp}:{body}", secretToken)).
+// This is separate from the one-time endpoint.url_validation challenge below, and is
+// what actually stops a stranger who finds the webhook URL from forging meeting/presence
+// events to remotely change the light.
+func (s *Server) verifyZoomSignature(r *http.Request, body []byte) bool {
+	if s.zoomSecret == "" {
+		return false
+	}
+	sigHeader := r.Header.Get("x-zm-signature")
+	tsHeader := r.Header.Get("x-zm-request-timestamp")
+	if sigHeader == "" || tsHeader == "" {
+		return false
+	}
+
+	message := "v0:" + tsHeader + ":" + string(body)
+	h := hmac.New(sha256.New, []byte(s.zoomSecret))
+	h.Write([]byte(message))
+	expected := "v0=" + hex.EncodeToString(h.Sum(nil))
+
+	return hmac.Equal([]byte(expected), []byte(sigHeader))
+}
+
 // handleZoomWebhook handles Zoom Marketplace webhook events and URL validation challenge.
 func (s *Server) handleZoomWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -265,7 +332,9 @@ func (s *Server) handleZoomWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Zoom Webhook URL Validation challenge
+	// Zoom Webhook URL Validation challenge: this is the one request that legitimately
+	// arrives before any signature can be verified (it's how Zoom proves you control the
+	// secret in the first place), so it's intentionally exempt from the check below.
 	if payload.Event == "endpoint.url_validation" {
 		plainToken := payload.Payload.PlainToken
 		h := hmac.New(sha256.New, []byte(s.zoomSecret))
@@ -281,6 +350,12 @@ func (s *Server) handleZoomWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.verifyZoomSignature(r, body) {
+		log.Printf("[Zoom Webhook] Rejected event with missing/invalid signature: %s", payload.Event)
+		http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+		return
+	}
+
 	log.Printf("[Zoom Webhook] Received event: %s", payload.Event)
 
 	switch payload.Event {
@@ -290,12 +365,17 @@ func (s *Server) handleZoomWebhook(w http.ResponseWriter, r *http.Request) {
 		s.stateMgr.OnZoomMeetingChanged(false)
 	case "user.presence_status_updated":
 		status := strings.ToLower(payload.Payload.Object.PresenceStatus)
-		if status == "in_meeting" || status == "do_not_disturb" {
+		switch status {
+		case "in_meeting", "do_not_disturb":
 			s.stateMgr.OnZoomMeetingChanged(true)
-		} else if status == "available" {
+		case "available":
 			s.stateMgr.OnZoomMeetingChanged(false)
-		} else if status == "away" {
-			s.stateMgr.SetManualColor(state.ColorYellow)
+			s.stateMgr.OnZoomPresenceAway(false)
+		case "away":
+			// Stays in AUTO mode (unlike SetManualColor) so meeting/lock detection
+			// keeps working once presence changes again.
+			s.stateMgr.OnZoomMeetingChanged(false)
+			s.stateMgr.OnZoomPresenceAway(true)
 		}
 	}
 
@@ -735,15 +815,28 @@ const dashboardHTML = `<!DOCTYPE html>
                     list.innerHTML = '<div style="font-size: 0.8rem; color: var(--text-dim); padding: 8px;">No SignalLights found nearby. Make sure your Arduino is powered on.</div>';
                 } else {
                     devices.forEach(d => {
+                        // Device name/address come from nearby BLE advertisements (untrusted,
+                        // attacker-controllable radio input) — build the DOM with text nodes
+                        // instead of innerHTML so a malicious advertised name can't inject markup.
                         const card = document.createElement('div');
                         card.className = 'device-card';
-                        card.innerHTML = ` + "`" + `
-                            <div class="device-card-info">
-                                <div>${d.name}</div>
-                                <div>MAC: ${d.address} | Signal: ${d.rssi} dBm</div>
-                            </div>
-                            <button class="btn-pair-sm" onclick="openPairModal('${d.address}', '${d.name}')">Pair</button>
-                        ` + "`" + `;
+
+                        const info = document.createElement('div');
+                        info.className = 'device-card-info';
+                        const nameLine = document.createElement('div');
+                        nameLine.textContent = d.name;
+                        const detailLine = document.createElement('div');
+                        detailLine.textContent = 'MAC: ' + d.address + ' | Signal: ' + d.rssi + ' dBm';
+                        info.appendChild(nameLine);
+                        info.appendChild(detailLine);
+
+                        const pairBtn = document.createElement('button');
+                        pairBtn.className = 'btn-pair-sm';
+                        pairBtn.textContent = 'Pair';
+                        pairBtn.addEventListener('click', () => openPairModal(d.address, d.name));
+
+                        card.appendChild(info);
+                        card.appendChild(pairBtn);
                         list.appendChild(card);
                     });
                 }

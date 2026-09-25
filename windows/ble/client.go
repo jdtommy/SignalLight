@@ -46,6 +46,8 @@ type Client struct {
 	targetName    string
 	sharedSecret  string
 	lastSentColor byte
+	sessionCancel chan struct{}
+	stopOnce      sync.Once
 }
 
 func NewClient(targetMAC, targetName, sharedSecret string, onConnect func(), onDisconnect func()) *Client {
@@ -58,7 +60,22 @@ func NewClient(targetMAC, targetName, sharedSecret string, onConnect func(), onD
 		targetMAC:     strings.ToUpper(strings.TrimSpace(targetMAC)),
 		targetName:    strings.TrimSpace(targetName),
 		sharedSecret:  strings.TrimSpace(sharedSecret),
-		lastSentColor: 'Y', // Default Yellow
+		lastSentColor: 'G', // Default Green when connected
+	}
+}
+
+func (c *Client) abortActiveSession() {
+	c.mu.Lock()
+	cancel := c.sessionCancel
+	c.sessionCancel = nil
+	c.mu.Unlock()
+
+	if cancel != nil {
+		select {
+		case <-cancel:
+		default:
+			close(cancel)
+		}
 	}
 }
 
@@ -86,7 +103,20 @@ func (c *Client) Start() error {
 	}
 
 	c.adapter.SetConnectHandler(func(device bluetooth.Device, connected bool) {
-		log.Printf("[BLE] Adapter link event for %s: connected=%v", device.Address.String(), connected)
+		addr := strings.ToUpper(device.Address.String())
+		log.Printf("[BLE] Adapter link event for %s: connected=%v", addr, connected)
+
+		if !connected {
+			c.mu.Lock()
+			activeMAC := c.targetMAC
+			isConn := c.connected
+			c.mu.Unlock()
+
+			if isConn && (activeMAC == "" || strings.EqualFold(activeMAC, addr)) {
+				log.Printf("[BLE] Active link lost for %s. Aborting session to reconnect immediately...", addr)
+				c.abortActiveSession()
+			}
+		}
 	})
 
 	go c.lifecycleLoop()
@@ -94,12 +124,14 @@ func (c *Client) Start() error {
 }
 
 func (c *Client) Stop() {
-	close(c.stopChan)
-	c.mu.Lock()
-	if c.device != nil {
-		_ = c.device.Disconnect()
-	}
-	c.mu.Unlock()
+	c.stopOnce.Do(func() {
+		close(c.stopChan)
+		c.mu.Lock()
+		if c.device != nil {
+			_ = c.device.Disconnect()
+		}
+		c.mu.Unlock()
+	})
 }
 
 // SendColor sends color command ('R', 'Y', 'G', '0') to the Arduino.
@@ -326,12 +358,13 @@ func (c *Client) PairDevice(macAddress string, friendlyName string, secret strin
 
 	time.Sleep(400 * time.Millisecond)
 
+	devCopy := device
 	// Hand over connection to active session - maintain the connection without dropping!
 	c.mu.Lock()
 	c.targetMAC = macAddress
 	c.targetName = friendlyName
 	c.sharedSecret = secret
-	c.device = &device
+	c.device = &devCopy
 	c.char = lightChar
 	c.authChar = authChar
 	c.connected = true
@@ -341,7 +374,7 @@ func (c *Client) PairDevice(macAddress string, friendlyName string, secret strin
 	log.Printf("[BLE] Paired successfully! Active session established with '%s' (%s).", friendlyName, macAddress)
 
 	// Run active session maintainer in background
-	go c.runSession(&device, lightChar)
+	go c.runSession(&devCopy, lightChar)
 
 	return nil
 }
@@ -359,6 +392,8 @@ func (c *Client) UnpairCurrent() (err error) {
 			err = fmt.Errorf("unpair exception: %v", r)
 		}
 	}()
+
+	c.abortActiveSession()
 
 	c.mu.Lock()
 	authChar := c.authChar
@@ -448,8 +483,8 @@ func (c *Client) lifecycleLoop() {
 			continue
 		}
 
-		// Windows WinRT requires a settling delay after connection before discovering services
-		time.Sleep(1 * time.Second)
+		// Windows WinRT settling delay after connection before discovering services
+		time.Sleep(350 * time.Millisecond)
 
 		// Verify connection is alive before discovering services
 		conn, cErr := device.Connected()
@@ -504,9 +539,15 @@ func (c *Client) lifecycleLoop() {
 			}
 
 			// Read response buffer
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(150 * time.Millisecond)
 			respBuf := make([]byte, 32)
-			n, _ := authChar.Read(respBuf)
+			n, readErr := authChar.Read(respBuf)
+			if readErr != nil {
+				log.Printf("[BLE] Auth response read failed: %v. Treating as auth failure.", readErr)
+				_ = device.Disconnect()
+				time.Sleep(3 * time.Second)
+				continue
+			}
 			respStr := string(respBuf[:n])
 			if strings.Contains(respStr, "NOT_PAIRED") || strings.Contains(respStr, "UNPAIRED") {
 				log.Println("[BLE] Device is in factory UNPAIRED mode (hardware reset detected)! Clearing saved pairing.")
@@ -525,6 +566,12 @@ func (c *Client) lifecycleLoop() {
 				log.Println("[BLE] Security error: Arduino rejected secret (AUTH_FAIL)!")
 				_ = device.Disconnect()
 				time.Sleep(4 * time.Second)
+				continue
+			}
+			if !strings.Contains(respStr, "AUTH_OK") {
+				log.Printf("[BLE] Unexpected/empty auth response (%q). Treating as auth failure.", respStr)
+				_ = device.Disconnect()
+				time.Sleep(3 * time.Second)
 				continue
 			}
 			authenticated = true
@@ -547,26 +594,47 @@ func (c *Client) lifecycleLoop() {
 	}
 }
 
+// runSession drives an established connection until it drops. It performs its own
+// WinRT thread/COM apartment setup (LockOSThread + RoInitialize) because it can be
+// invoked either synchronously from lifecycleLoop's already-initialized goroutine, or
+// spawned as a brand-new goroutine from PairDevice — the latter would otherwise make
+// WinRT calls (device.Connected/Write/Disconnect) from an uninitialized OS thread,
+// which is unsafe. LockOSThread/RoInitialize are both safe to nest on the same thread.
 func (c *Client) runSession(device *bluetooth.Device, lightChar *bluetooth.DeviceCharacteristic) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	_ = ole.RoInitialize(1)
+	defer ole.CoUninitialize()
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[BLE] Recovered from runSession panic: %v", r)
 		}
 	}()
 
+	cancelChan := make(chan struct{})
+	c.mu.Lock()
+	c.sessionCancel = cancelChan
+	c.mu.Unlock()
+
+	defer c.abortActiveSession()
+
 	log.Printf("[BLE] Service & Characteristics ready!")
 	if c.onConnect != nil {
 		c.onConnect()
 	}
 
+	// Settle delay to allow onConnect state callback to set lastSentColor
+	time.Sleep(100 * time.Millisecond)
+
 	// Send initial state immediately
 	c.mu.Lock()
 	initColor := c.lastSentColor
 	c.mu.Unlock()
-	_ = c.writeChar(lightChar, []byte{initColor})
+	_ = c.writeControl(lightChar, initColor)
 
 	// Maintain connection & handle commands/heartbeats
-	c.connectionLoop(device, lightChar)
+	c.connectionLoop(device, lightChar, cancelChan)
 
 	if device != nil {
 		_ = device.Disconnect()
@@ -663,7 +731,7 @@ func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar *b
 	}
 
 	for attempt := 1; attempt <= 3; attempt++ {
-		time.Sleep(time.Duration(attempt*400) * time.Millisecond)
+		time.Sleep(time.Duration(attempt*200) * time.Millisecond)
 
 		services, sErr := device.DiscoverServices([]bluetooth.UUID{ServiceUUID})
 		if sErr != nil || len(services) == 0 {
@@ -692,7 +760,63 @@ func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar *b
 	return nil, nil, err
 }
 
+// writePing sends 'P' using Write with response (acknowledged).
+// We strictly do NOT fall back to WriteWithoutResponse here, because WriteWithoutResponse
+// succeeds in Windows WinRT even when the peripheral is completely disconnected!
+func (c *Client) writePing(char *bluetooth.DeviceCharacteristic) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered from writePing panic: %v", r)
+		}
+	}()
+
+	if char == nil {
+		return errors.New("characteristic is nil")
+	}
+
+	_, err = char.Write([]byte{'P'})
+	return err
+}
+
+// writeControl sends a control command byte ('R', 'Y', 'G', '0').
+// Tries Write with response first; if that fails, checks OS connection and tries WriteWithoutResponse.
+func (c *Client) writeControl(char *bluetooth.DeviceCharacteristic, cmd byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered from writeControl panic: %v", r)
+		}
+	}()
+
+	if char == nil {
+		return errors.New("characteristic is nil")
+	}
+
+	_, err = char.Write([]byte{cmd})
+	if err == nil {
+		return nil
+	}
+
+	// If Write failed, check if device is disconnected
+	c.mu.Lock()
+	dev := c.device
+	c.mu.Unlock()
+	if dev != nil {
+		if conn, cErr := dev.Connected(); cErr == nil && !conn {
+			return fmt.Errorf("device is disconnected: %w", err)
+		}
+	}
+
+	_, err = char.WriteWithoutResponse([]byte{cmd})
+	return err
+}
+
 func (c *Client) writeChar(char *bluetooth.DeviceCharacteristic, data []byte) (err error) {
+	if len(data) == 1 && data[0] == 'P' {
+		return c.writePing(char)
+	}
+	if len(data) == 1 {
+		return c.writeControl(char, data[0])
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("recovered from writeChar panic: %v", r)
@@ -709,31 +833,54 @@ func (c *Client) writeChar(char *bluetooth.DeviceCharacteristic, data []byte) (e
 	return err
 }
 
-func (c *Client) connectionLoop(device *bluetooth.Device, char *bluetooth.DeviceCharacteristic) {
+func (c *Client) connectionLoop(device *bluetooth.Device, char *bluetooth.DeviceCharacteristic, cancelChan <-chan struct{}) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[BLE] Recovered from connectionLoop panic: %v", r)
 		}
 	}()
 
-	heartbeat := time.NewTicker(4 * time.Second)
+	heartbeat := time.NewTicker(3 * time.Second)
 	defer heartbeat.Stop()
+
+	heartbeatCounter := 0
 
 	for {
 		select {
 		case <-c.stopChan:
 			return
+		case <-cancelChan:
+			log.Println("[BLE] Connection loop aborted by link loss event.")
+			return
 		case cmd := <-c.sendChan:
-			err := c.writeChar(char, []byte{cmd})
+			err := c.writeControl(char, cmd)
 			if err != nil {
-				log.Printf("[BLE] Write error: %v. Connection lost.", err)
+				log.Printf("[BLE] Command write error: %v. Connection lost.", err)
 				return
 			}
 		case <-heartbeat.C:
-			err := c.writeChar(char, []byte{'P'})
+			// 1. Check OS link status
+			if isConn, err := device.Connected(); err == nil && !isConn {
+				log.Println("[BLE] Device reports disconnected in OS stack. Connection lost.")
+				return
+			}
+
+			// 2. Active state-sync heartbeat: Send current active color (e.g. 'G').
+			// This satisfies the watchdog AND guarantees self-healing: if the Arduino
+			// ever experienced a momentary timeout or glitch, the heartbeat immediately restores it!
+			c.mu.Lock()
+			activeColor := c.lastSentColor
+			c.mu.Unlock()
+
+			err := c.writeControl(char, activeColor)
 			if err != nil {
 				log.Printf("[BLE] Heartbeat error: %v. Connection lost.", err)
 				return
+			}
+
+			heartbeatCounter++
+			if heartbeatCounter%20 == 0 { // Log every 60s (20 * 3s)
+				log.Printf("[BLE] Heartbeat sync healthy (active='%c')", activeColor)
 			}
 		}
 	}

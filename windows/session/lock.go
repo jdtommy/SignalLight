@@ -4,33 +4,39 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var (
-	user32                             = syscall.NewLazyDLL("user32.dll")
-	wtsapi32                           = syscall.NewLazyDLL("wtsapi32.dll")
-	procRegisterClassExW               = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW                = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW                 = user32.NewProc("DefWindowProcW")
-	procDestroyWindow                  = user32.NewProc("DestroyWindow")
-	procGetMessageW                    = user32.NewProc("GetMessageW")
-	procTranslateMessage               = user32.NewProc("TranslateMessage")
-	procDispatchMessageW               = user32.NewProc("DispatchMessageW")
-	procPostMessageW                   = user32.NewProc("PostMessageW")
-	procOpenInputDesktop               = user32.NewProc("OpenInputDesktop")
-	procCloseDesktop                   = user32.NewProc("CloseDesktop")
-	procWTSRegisterSessionNotification = wtsapi32.NewProc("WTSRegisterSessionNotification")
+	user32                               = syscall.NewLazyDLL("user32.dll")
+	wtsapi32                             = syscall.NewLazyDLL("wtsapi32.dll")
+	procRegisterClassExW                 = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW                  = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW                   = user32.NewProc("DefWindowProcW")
+	procDestroyWindow                    = user32.NewProc("DestroyWindow")
+	procGetMessageW                      = user32.NewProc("GetMessageW")
+	procTranslateMessage                 = user32.NewProc("TranslateMessage")
+	procDispatchMessageW                 = user32.NewProc("DispatchMessageW")
+	procPostMessageW                     = user32.NewProc("PostMessageW")
+	procOpenInputDesktop                 = user32.NewProc("OpenInputDesktop")
+	procCloseDesktop                     = user32.NewProc("CloseDesktop")
+	procWTSRegisterSessionNotification   = wtsapi32.NewProc("WTSRegisterSessionNotification")
 	procWTSUnRegisterSessionNotification = wtsapi32.NewProc("WTSUnRegisterSessionNotification")
 )
 
 const (
-	WM_CLOSE               = 0x0010
-	WM_WTSSESSION_CHANGE   = 0x02B1
-	WTS_SESSION_LOCK       = 0x7
-	WTS_SESSION_UNLOCK     = 0x8
+	WM_CLOSE                = 0x0010
+	WM_WTSSESSION_CHANGE    = 0x02B1
+	WTS_SESSION_LOCK        = 0x7
+	WTS_SESSION_UNLOCK      = 0x8
 	NOTIFY_FOR_THIS_SESSION = 0
+
+	// ERROR_CLASS_ALREADY_EXISTS is the numeric Win32 error code (locale-independent,
+	// unlike comparing err.Error() against the English string "Class already exists.").
+	ERROR_CLASS_ALREADY_EXISTS = syscall.Errno(1410)
 )
 
 type WNDCLASSEXW struct {
@@ -60,13 +66,11 @@ type MSG struct {
 type Watcher struct {
 	hwnd          uintptr
 	onLockChanged func(locked bool)
-	stopChan      chan struct{}
 }
 
 func NewWatcher(onLockChanged func(locked bool)) *Watcher {
 	return &Watcher{
 		onLockChanged: onLockChanged,
-		stopChan:      make(chan struct{}),
 	}
 }
 
@@ -103,7 +107,7 @@ func (w *Watcher) Start() error {
 		}
 
 		atom, _, err := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wndClass)))
-		if atom == 0 && err != syscall.Errno(0) && err.Error() != "Class already exists." {
+		if atom == 0 && err != syscall.Errno(0) && err != ERROR_CLASS_ALREADY_EXISTS {
 			ready <- fmt.Errorf("failed to register window class: %w", err)
 			return
 		}
@@ -150,9 +154,20 @@ func (w *Watcher) Start() error {
 			if msg.Message == WM_WTSSESSION_CHANGE {
 				switch msg.Wparam {
 				case WTS_SESSION_LOCK:
-					log.Println("[Session] Workstation locked")
-					if w.onLockChanged != nil {
-						w.onLockChanged(true)
+					// WTS_SESSION_LOCK also fires for UAC elevation prompts, Windows
+					// Hello, and other secure-desktop switches — not just a real
+					// Win+L lock — because they all use the same desktop-switch
+					// mechanism under the hood. Confirm the real lock-screen host
+					// process is actually running before treating this as "away";
+					// otherwise a UAC prompt turns the light Yellow for a few
+					// seconds until the matching (real) UNLOCK below corrects it.
+					if isLogonUIRunning() {
+						log.Println("[Session] Workstation locked (LogonUI confirmed)")
+						if w.onLockChanged != nil {
+							w.onLockChanged(true)
+						}
+					} else {
+						log.Println("[Session] Ignored WTS_SESSION_LOCK: no LogonUI.exe process found (likely a UAC/Windows Hello secure-desktop prompt, not a real lock)")
 					}
 				case WTS_SESSION_UNLOCK:
 					log.Println("[Session] Workstation unlocked")
@@ -173,8 +188,47 @@ func (w *Watcher) Start() error {
 	return <-ready
 }
 
+// isLogonUIRunning reports whether Windows' real lock/logon screen host process
+// (LogonUI.exe) is currently running. It retries briefly since LogonUI can take a
+// moment to spawn after the WTS_SESSION_LOCK notification is delivered.
+func isLogonUIRunning() bool {
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(150 * time.Millisecond)
+		}
+		found, ok := logonUIProcessExists()
+		if !ok {
+			// Couldn't enumerate processes at all: fail open to the WTS signal
+			// rather than silently disabling lock detection.
+			return true
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func logonUIProcessExists() (found bool, ok bool) {
+	snapshot, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return false, false
+	}
+	defer syscall.CloseHandle(snapshot)
+
+	var entry syscall.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	for e := syscall.Process32First(snapshot, &entry); e == nil; e = syscall.Process32Next(snapshot, &entry) {
+		name := syscall.UTF16ToString(entry.ExeFile[:])
+		if strings.EqualFold(name, "LogonUI.exe") {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 func (w *Watcher) Stop() {
-	close(w.stopChan)
 	if w.hwnd != 0 {
 		procPostMessageW.Call(w.hwnd, WM_CLOSE, 0, 0)
 	}

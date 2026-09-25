@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
@@ -62,8 +63,12 @@ func awaitAsyncOperation(asyncOperation *foundation.IAsyncOperation, genericPara
 
 	asyncOperation.SetCompleted(handler)
 
-	// Wait until async operation has stopped, and finish.
-	<-waitChan
+	// Wait until async operation has stopped, or timeout after 6 seconds to prevent deadlocks.
+	select {
+	case <-waitChan:
+	case <-time.After(6 * time.Second):
+		return errors.New("bluetooth async operation timed out")
+	}
 
 	if status != foundation.AsyncStatusCompleted {
 		if err := getAsyncError(asyncOperation); err != nil {

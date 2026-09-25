@@ -91,18 +91,30 @@ func (l *Listener) Start() error {
 			{HOTKEY_AUTO, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x41, ActionAuto},
 		}
 
+		// Register each hotkey independently: one shortcut already being owned by
+		// another app (Ctrl+Shift+R is a common "reload" binding) shouldn't prevent
+		// the other three from working.
+		registered := hotkeys[:0:0]
 		for _, hk := range hotkeys {
 			r, _, err := procRegisterHotKey.Call(0, hk.id, hk.mod, hk.vk)
 			if r == 0 {
-				ready <- fmt.Errorf("failed to register hotkey ID %d: %v", hk.id, err)
-				return
+				log.Printf("[Hotkey] Failed to register %s (another app may already use this shortcut): %v", hk.act, err)
+				continue
 			}
+			registered = append(registered, hk)
 		}
 
+		if len(registered) == 0 {
+			ready <- fmt.Errorf("failed to register any global hotkeys")
+			return
+		}
+		if len(registered) < len(hotkeys) {
+			log.Printf("[Hotkey] %d/%d hotkeys registered successfully.", len(registered), len(hotkeys))
+		}
 		ready <- nil
 
 		defer func() {
-			for _, hk := range hotkeys {
+			for _, hk := range registered {
 				procUnregisterHotKey.Call(0, hk.id)
 			}
 		}()

@@ -1,6 +1,7 @@
 package serial
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -9,6 +10,28 @@ import (
 	"go.bug.st/serial"
 	"go.bug.st/serial/enumerator"
 )
+
+const writeTimeout = 2 * time.Second
+
+// writeWithTimeout guards against a stalled USB link blocking the connection loop
+// forever: go.bug.st/serial's Write has no built-in deadline, so a wedged driver or
+// unplugged-but-not-yet-detected device would otherwise hang here indefinitely,
+// silently freezing heartbeats and color commands. On timeout we force-close the
+// port to unblock the abandoned write and surface the stall as a disconnect.
+func writeWithTimeout(p serial.Port, data []byte, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Write(data)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		_ = p.Close()
+		return fmt.Errorf("write timed out after %v", timeout)
+	}
+}
 
 type Client struct {
 	portName      string
@@ -29,7 +52,7 @@ func NewClient(portName string, onConnect func(), onDisconnect func()) *Client {
 		onDisconnect:  onDisconnect,
 		stopChan:      make(chan struct{}),
 		sendChan:      make(chan string, 32),
-		lastSentColor: "YELLOW",
+		lastSentColor: "GREEN",
 	}
 }
 
@@ -119,7 +142,7 @@ func (c *Client) lifecycleLoop() {
 		c.mu.Lock()
 		initColor := c.lastSentColor
 		c.mu.Unlock()
-		_, _ = p.Write([]byte(initColor + "\n"))
+		_ = writeWithTimeout(p, []byte(initColor+"\n"), writeTimeout)
 
 		// Maintain loop
 		c.connectionLoop(p)
@@ -148,14 +171,12 @@ func (c *Client) connectionLoop(p serial.Port) {
 		case <-c.stopChan:
 			return
 		case cmd := <-c.sendChan:
-			_, err := p.Write([]byte(cmd + "\n"))
-			if err != nil {
+			if err := writeWithTimeout(p, []byte(cmd+"\n"), writeTimeout); err != nil {
 				log.Printf("[Serial] Write error: %v", err)
 				return
 			}
 		case <-heartbeat.C:
-			_, err := p.Write([]byte("PING\n"))
-			if err != nil {
+			if err := writeWithTimeout(p, []byte("PING\n"), writeTimeout); err != nil {
 				log.Printf("[Serial] Heartbeat error: %v", err)
 				return
 			}

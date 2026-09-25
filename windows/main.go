@@ -35,10 +35,12 @@ func main() {
 	checkInterval := flag.Duration("interval", 1*time.Second, "Zoom polling interval")
 	flag.Parse()
 
-	// Load stored configuration from %APPDATA%\SignalLight\config.json
+	// Load stored configuration from %APPDATA%\SignalLight\config.json.
+	// Load() always returns a non-nil config (an empty/unpaired default on error),
+	// so a corrupt or unreadable file degrades to "unpaired" instead of crashing.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Printf("[Config] Warning: error reading config: %v", err)
+		log.Printf("[Config] Warning: error reading config, starting unpaired: %v", err)
 	}
 
 	// Command-line flag overrides
@@ -95,7 +97,8 @@ func main() {
 
 	// Subscribe hardware sender to state changes
 	stateMgr.Subscribe(func(st state.Status) {
-		log.Printf("[State] Color: %s | Mode: %s | ZoomMeeting: %v", st.Color, st.Mode, st.ZoomMeeting)
+		log.Printf("[State] Color: %s | Mode: %s | ZoomMeeting: %v | SessionLocked: %v | Connected: %v",
+			st.Color, st.Mode, st.ZoomMeeting, st.SessionLocked, st.Connected)
 		sendColorToHardware(st.Color)
 	})
 

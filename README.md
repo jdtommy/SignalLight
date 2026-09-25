@@ -84,9 +84,10 @@ SignalLight/
 5. Select `Tools -> Board -> Arduino Nano ESP32` and choose your COM port.
 6. Click **Upload**.
 
-### Option B: MicroPython
-If you flashed MicroPython onto the Nano ESP32:
-- Copy [`arduino/micropython/main.py`](file:///C:/Users/jdtom/dev/SignalLight/arduino/micropython/main.py) to the board as `main.py`.
+### Option B: MicroPython (⚠️ Deprecated / Not Compatible)
+[`arduino/micropython/main.py`](file:///C:/Users/jdtom/dev/SignalLight/arduino/micropython/main.py) is kept only as a reference starting point. It has no Auth
+characteristic and cannot complete the PAIR/AUTH handshake the Windows app requires, so
+pairing from the web dashboard will not work against it. Use Option A.
 
 ---
 
@@ -119,18 +120,21 @@ The Windows app is written in **Go (Golang)**. It features:
 
 ### Running the App
 
-#### Method 1: Using the Pre-compiled Binary
-Double-click [`windows/signallight.exe`](file:///C:/Users/jdtom/dev/SignalLight/windows/signallight.exe) or run from PowerShell:
-```powershell
-cd C:\Users\jdtom\dev\SignalLight\windows
-.\signallight.exe
-```
-
-#### Method 2: Running from Source
+#### Method 1: Running from Source (Recommended)
+This bypasses Windows 11 Smart App Control policies without requiring code-signing certificates:
 ```powershell
 cd C:\Users\jdtom\dev\SignalLight\windows
 go run .
 ```
+Or simply double-click [`windows/run.bat`](file:///C:/Users/jdtom/dev/SignalLight/windows/run.bat) or run [`windows/run.ps1`](file:///C:/Users/jdtom/dev/SignalLight/windows/run.ps1).
+
+#### Method 2: Using the Pre-compiled Binary
+```powershell
+cd C:\Users\jdtom\dev\SignalLight\windows
+.\signallight.exe
+```
+> [!NOTE]
+> On Windows 11 systems with **Smart App Control (SAC)** enabled, unsigned standalone `.exe` binaries may be blocked by policy. Running via `go run .` is recommended for local development until an official code-signing certificate is integrated into the build pipeline (see Roadmap below).
 
 #### Command Line Options
 | Flag | Default | Description |
@@ -140,6 +144,11 @@ go run .
 | `-serial` | `""` | Optional USB COM port (e.g. `COM3` or `auto`) if using USB cable |
 | `-port` | `""` | Web dashboard port (default: auto-allocated open port, e.g. 9120-9900, saved in config.json) |
 | `-interval` | `1s` | Zoom meeting polling interval |
+
+---
+
+## 📋 Future Roadmap & TODO
+- [ ] **Binary Code Signing & Packaging**: Setup Windows code-signing pipeline (trusted Authenticode certificate) or MSIX packaging so standalone `signallight.exe` executes seamlessly on Windows 11 systems with strict Smart App Control enabled.
 
 ---
 

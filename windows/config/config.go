@@ -49,12 +49,16 @@ func Load() (*Config, error) {
 			cachedConf = &Config{Paired: false}
 			return cachedConf, nil
 		}
-		return nil, err
+		// Unreadable config file (e.g. permissions): fail safe with an empty unpaired
+		// config rather than nil, which would crash any caller that doesn't check err.
+		return &Config{Paired: false}, err
 	}
 
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
+		// Corrupt config file: fail safe with an empty unpaired config rather than
+		// returning nil, which would crash any caller that doesn't check err.
+		return &Config{Paired: false}, err
 	}
 
 	cfg.TargetMAC = strings.ToUpper(strings.TrimSpace(cfg.TargetMAC))
