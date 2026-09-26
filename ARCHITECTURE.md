@@ -27,7 +27,7 @@ Used for state synchronization, manual commands, and heartbeat pings:
 
 #### Auth Characteristic (`19B10002`)
 Used for discovery, secure pairing handshakes, and unpairing:
-- `PAIR:<FriendlyName>:<SharedSecret>`: Initial pairing command when device is in factory unpaired mode. Returns `PAIR_OK` or error (`ERR:ALREADY_PAIRED`, `ERR:BAD_FORMAT`).
+- `PAIR:<FriendlyName>:<SharedSecret>`: Initial pairing command when device is in factory unpaired mode. Returns `PAIR_OK` or error (`ERR:ALREADY_PAIRED`, `ERR:BAD_FORMAT`). `SharedSecret` is generated automatically by the Windows app (random 128-bit value) — the user never sees or types it, only the friendly name.
 - `AUTH:<SharedSecret>`: Authentication challenge response sent by Central upon each connection. Returns `AUTH_OK` or `AUTH_FAIL`.
 - `UNPAIR`: Factory resets device credentials and reboots into unpaired mode. Returns `UNPAIR_OK`.
 - `STATUS?`: Queries device mode. Returns `STATUS:PAIRED` or `STATUS:UNPAIRED`.

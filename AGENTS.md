@@ -44,7 +44,7 @@
 
 ### Security & Pairing Model
 - **Unpaired Mode:** Advertises as `SignalLight-[Last 4 MAC]` (e.g. `SignalLight-69F5`). Onboard/external Yellow LED pulses slowly.
-- **Pairing Handshake:** Central writes `PAIR:<FriendlyName>:<SharedSecret>` to Auth characteristic within 4 seconds. Returns `PAIR_OK` and stores credentials to NVS flash (`Preferences`).
+- **Pairing Handshake:** Central writes `PAIR:<FriendlyName>:<SharedSecret>` to Auth characteristic within 4 seconds. Returns `PAIR_OK` and stores credentials to NVS flash (`Preferences`). The Windows app generates `SharedSecret` itself (a random 128-bit value, `windows/server/server.go`'s `generateSecret()`) — the user only ever types the friendly name, never a secret.
 - **Paired Mode:** Advertises as `<FriendlyName>` (e.g. `Jarads8`). Requires `AUTH:<SharedSecret>` within 4 seconds of connection.
 - **Factory Reset Options:**
   1. Write `UNPAIR` to Auth characteristic.

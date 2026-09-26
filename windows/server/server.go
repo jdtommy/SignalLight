@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -207,6 +208,21 @@ func (s *Server) handleBLEScan(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(devices)
 }
 
+// generateSecret creates a random 128-bit shared secret for the BLE pairing
+// handshake. Nothing about this secret is ever shown to or typed by the user —
+// it's only ever used programmatically between the app and the Arduino — so
+// there's no reason to have a human invent one. A random value is also strictly
+// stronger than anything a person would type in (short, memorable, guessable).
+// Hex-encoded so it can't contain characters that would confuse the Arduino's
+// "PAIR:<name>:<secret>" message parsing.
+func generateSecret() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
 func (s *Server) handleBLEPair(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
@@ -217,7 +233,6 @@ func (s *Server) handleBLEPair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Address string `json:"address"`
 		Name    string `json:"name"`
-		Secret  string `json:"secret"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -227,10 +242,9 @@ func (s *Server) handleBLEPair(w http.ResponseWriter, r *http.Request) {
 
 	req.Address = strings.ToUpper(strings.TrimSpace(req.Address))
 	req.Name = strings.TrimSpace(req.Name)
-	req.Secret = strings.TrimSpace(req.Secret)
 
-	if req.Address == "" || req.Name == "" || req.Secret == "" {
-		http.Error(w, `{"error":"address, name, and secret are required"}`, http.StatusBadRequest)
+	if req.Address == "" || req.Name == "" {
+		http.Error(w, `{"error":"address and name are required"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -239,7 +253,13 @@ func (s *Server) handleBLEPair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.bleClient.PairDevice(req.Address, req.Name, req.Secret); err != nil {
+	secret, err := generateSecret()
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err := s.bleClient.PairDevice(req.Address, req.Name, secret); err != nil {
 		jsonError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -249,7 +269,7 @@ func (s *Server) handleBLEPair(w http.ResponseWriter, r *http.Request) {
 	cfg := &config.Config{
 		TargetMAC:    req.Address,
 		DeviceName:   req.Name,
-		SharedSecret: req.Secret,
+		SharedSecret: secret,
 		Paired:       true,
 		WebPort:      cached.WebPort,
 	}
@@ -692,7 +712,8 @@ const dashboardHTML = `<!DOCTYPE html>
 
             <div id="device-info-unpaired">
                 <p style="font-size: 0.8rem; color: var(--text-dim); margin-bottom: 10px;">
-                    Scan nearby to discover your SignalLight, assign it a custom name, and lock it with a security secret.
+                    Scan nearby to discover your SignalLight and assign it a custom name. A security secret is generated
+                    automatically — nothing to remember or type.
                 </p>
                 <button id="btn-scan" class="btn-scan" onclick="scanLights()">🔍 Scan for Nearby Lights</button>
                 <div id="scan-results" class="discovered-list"></div>
@@ -716,10 +737,9 @@ const dashboardHTML = `<!DOCTYPE html>
                 <label>Custom Device Name</label>
                 <input type="text" id="modal-name" placeholder="e.g. Office Desk">
             </div>
-            <div class="form-group">
-                <label>Shared Security Secret / PIN</label>
-                <input type="password" id="modal-secret" placeholder="Enter a secret password or PIN">
-            </div>
+            <p style="font-size: 0.75rem; color: var(--text-dim); margin: -8px 0 12px;">
+                A security secret will be generated automatically for this device — nothing to remember or type.
+            </p>
             <div class="modal-buttons">
                 <button class="btn-cancel" onclick="closeModal()">Cancel</button>
                 <button class="btn-confirm" id="btn-submit-pair" onclick="submitPairing()">Save & Pair</button>
@@ -851,7 +871,6 @@ const dashboardHTML = `<!DOCTYPE html>
         function openPairModal(mac, name) {
             document.getElementById('modal-mac').value = mac;
             document.getElementById('modal-name').value = name.startsWith('SignalLight-') ? 'Office Desk' : name;
-            document.getElementById('modal-secret').value = '';
             document.getElementById('pair-modal').style.display = 'flex';
         }
 
@@ -862,10 +881,9 @@ const dashboardHTML = `<!DOCTYPE html>
         async function submitPairing() {
             const mac = document.getElementById('modal-mac').value;
             const name = document.getElementById('modal-name').value.trim();
-            const secret = document.getElementById('modal-secret').value.trim();
 
-            if (!name || !secret) {
-                alert('Please enter a custom device name and a security secret.');
+            if (!name) {
+                alert('Please enter a custom device name.');
                 return;
             }
 
@@ -877,7 +895,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 const res = await fetch('/api/ble/pair', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ address: mac, name: name, secret: secret })
+                    body: JSON.stringify({ address: mac, name: name })
                 });
                 const data = await res.json();
                 if (!res.ok || data.error) {

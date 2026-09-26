@@ -12,6 +12,27 @@ import (
 	"signallight/state"
 )
 
+func TestGenerateSecretIsRandomHexOfExpectedLength(t *testing.T) {
+	a, err := generateSecret()
+	if err != nil {
+		t.Fatalf("generateSecret() error: %v", err)
+	}
+	b, err := generateSecret()
+	if err != nil {
+		t.Fatalf("generateSecret() error: %v", err)
+	}
+
+	if len(a) != 32 {
+		t.Errorf("expected a 32-character hex string (16 random bytes), got length %d: %q", len(a), a)
+	}
+	if _, err := hex.DecodeString(a); err != nil {
+		t.Errorf("generateSecret() did not return valid hex: %v", err)
+	}
+	if a == b {
+		t.Errorf("two calls to generateSecret() returned the same value — not random")
+	}
+}
+
 func newTestServer(zoomSecret string) *Server {
 	stateMgr := state.NewManager()
 	stateMgr.SetConnected(true)
