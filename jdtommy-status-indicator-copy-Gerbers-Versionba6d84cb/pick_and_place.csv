@@ -1,6 +1,7 @@
 ﻿Designator,Mid X,Mid Y,Layer,Rotation,Package,Value
 "CN1","13.9975mm","15.56mm","Top",270,"CONN-TH_B2B-XH-A-LF-SN",""
 "CN2","-13.4623mm","15.58mm","Top",90,"CONN-TH_B4B-XH-A-LF-SN",""
+"CN3","13.9975mm","6.3813mm","Top",270,"CONN-TH_B2B-XH-A-LF-SN",""
 "Q4","-14.4123mm","4.1113mm","Top",90,"",""
 "Q5","-14.4123mm","-5.8111mm","Top",90,"",""
 "Q6","-14.4123mm","-15.15mm","Top",90,"",""

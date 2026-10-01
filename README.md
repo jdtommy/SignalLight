@@ -45,7 +45,7 @@ To keep Yellow ON when the Arduino is disconnected or powered off:
 - When the Arduino boots, the firmware immediately drives D3 HIGH and D2/D4 LOW.
 
 ### 🖨️ Custom Driver PCB
-[`jdtommy-status-indicator.edif`](file:///C:/Users/jdtom/dev/SignalLight/jdtommy-status-indicator.edif) (netlist), [`status-indicator-dxf/`](file:///C:/Users/jdtom/dev/SignalLight/status-indicator-dxf) / [`status-indicator-svg/`](file:///C:/Users/jdtom/dev/SignalLight/status-indicator-svg) (plot previews), and [`jdtommy-status-indicator-Gerbers-Version1ef73905/`](file:///C:/Users/jdtom/dev/SignalLight/jdtommy-status-indicator-Gerbers-Version1ef73905) (fab package) are a small 2-layer PCB export (from [Flux](https://flux.ai)) that replaces the breadboard wiring above with a real board. It mounts an Arduino Nano ESP32 and drives the three LED channels through three `2N3904`-family NPN transistors (instead of the MOSFETs described above — a valid alternative for a modest LED current draw) as low-side switches, with the same Yellow-defaults-on pull-up resistor design:
+[`jdtommy-status-indicator-copy-Gerbers-Versionba6d84cb/`](jdtommy-status-indicator-copy-Gerbers-Versionba6d84cb) (fab package) is a small 2-layer PCB export (from [Flux](https://flux.ai)) that replaces the breadboard wiring above with a real board. It mounts an Arduino Nano ESP32 and drives the three LED channels through three `2N3904`-family NPN transistors (instead of the MOSFETs described above — a valid alternative for a modest LED current draw) as low-side switches, with the same Yellow-defaults-on pull-up resistor design:
 
 | Connector | Pin | Signal |
 |-----------|-----|--------|
@@ -55,18 +55,17 @@ To keep Yellow ON when the Arduino is disconnected or powered off:
 | | 2 | Red cathode (via Q4, driven by D2, R2 = 1kΩ base resistor) |
 | | 3 | Yellow cathode (via Q5, driven by D3, R3 = 1kΩ base resistor, **R1 = 10kΩ pull-up to 3.3V**) |
 | | 4 | Green cathode (via Q6, driven by D4, R4 = 1kΩ base resistor) |
+| **CN3** (2-pin, unpair button) | 1 | GND |
+| | 2 | `D5` (firmware's internal pull-up; no external resistor) |
 
-Board outline is roughly **19mm × 45mm**.
-
-> [!IMPORTANT]
-> **Needed in the next board revision: an unpair button on `D5`.** The firmware now uses a momentary button from `D5` to GND (internal pull-up, so no external resistor) as the physical factory-reset control: hold it 10 seconds to unpair. The current board (`Version1ef73905`) has no footprint for it. Add a 2-pin tactile switch, or a 2-pin JST XH header for a panel-mount button, between `D5` and GND before ordering. Until then, the button can be wired directly to the Nano's `D5` and `GND` pins, or you can unpair from the dashboard or by typing `UNPAIR` in the serial monitor.
+Board outline is roughly **19mm × 45mm**. Wire a normally-open momentary (panel-mount) button to **CN3**; holding it for 10 seconds unpairs the light (see the firmware notes in [ARCHITECTURE.md](ARCHITECTURE.md)).
 
 > [!NOTE]
-> **Bare PCB fabrication: ready to order.** `jdtommy-status-indicator-Gerbers-Version1ef73905/` has properly formatted Gerber X2 files for all layers, a real Excellon drill file, and an IPC-D-356 bare-board test netlist — this is a standard fab package any house (JLCPCB, PCBWay, OSH Park, etc.) should accept directly. (The DXF/SVG folders are just plot previews from an earlier export and aren't needed for ordering.)
+> **Bare PCB fabrication: ready to order.** `jdtommy-status-indicator-copy-Gerbers-Versionba6d84cb/` has properly formatted Gerber X2 files for all layers, a real Excellon drill file, and an IPC-D-356 bare-board test netlist — this is a standard fab package any house (JLCPCB, PCBWay, OSH Park, etc.) should accept directly. The `jdtommy-status-indicator.edif` netlist and the DXF/SVG plot folders are from the **previous** board revision (no CN3) and aren't needed for ordering.
 >
 > **Turnkey SMD assembly: not ready — fix the BOM first.** Every vendor BOM CSV in `BOM/` groups R1–R4 into a single line item labeled "1kΩ" (Flux's exporter grouped them by shared footprint and lost the distinct value). The correct values — confirmed in `pick_and_place.csv` — are **R1 = 10kΩ**, **R2/R3/R4 = 1kΩ**. If you submit a BOM as-is, R1 (the Yellow failsafe pull-up) would get placed as 1kΩ instead of 10kΩ: Yellow would still default on, just with ~10x more continuous current through that pull-up than intended. Split R1 into its own line before ordering assembly.
 >
-> Also note: **U2 (the Arduino Nano ESP32) can't be placed by any SMT line** — it's a whole dev board, not a stocked part, so it needs to be hand-soldered/socketed on regardless of which assembly path you use. The two JST connectors (CN1/CN2) do have real LCSC part numbers (`C158012`, `C144395`) if you want an assembly house to place those.
+> Also note: **U2 (the Arduino Nano ESP32) can't be placed by any SMT line** — it's a whole dev board, not a stocked part, so it needs to be hand-soldered/socketed on regardless of which assembly path you use. The three JST connectors do have real LCSC part numbers (`C158012` for the 2-pin CN1/CN3, `C144395` for the 4-pin CN2) if you want an assembly house to place those.
 
 ---
 
@@ -89,10 +88,10 @@ SignalLight/
 │   ├── go.mod / go.sum
 │   ├── main.go                  # Windows application entry point
 │   └── signallight.exe          # Compiled standalone Windows executable
-├── jdtommy-status-indicator.edif              # Driver PCB netlist (see Custom Driver PCB above)
+├── jdtommy-status-indicator.edif              # Driver PCB netlist (previous revision, no CN3)
 ├── status-indicator-dxf/                      # Driver PCB plot previews (DXF, not needed for ordering)
 ├── status-indicator-svg/                      # Driver PCB plot previews (SVG, not needed for ordering)
-├── jdtommy-status-indicator-Gerbers-Version1ef73905/   # Driver PCB fab package: Gerbers, drill file, BOMs, pick-and-place (see above)
+├── jdtommy-status-indicator-copy-Gerbers-Versionba6d84cb/   # Driver PCB fab package: Gerbers, drill file, BOMs, pick-and-place (see above)
 └── README.md
 ```
 

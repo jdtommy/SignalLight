@@ -1,5 +1,5 @@
 Project Name: Status Indicator Copy
-Project Version: #1ef73905
+Project Version: #ba6d84cb
 Project Url: https://www.flux.ai/jdtommy/status-indicator-copy~ga
 
 Project Description:
@@ -23,12 +23,12 @@ Component Positions, for assembly (Pick and Place, CSV): pick_and_place.csv
 
 Bill of Materials: multiple versions are provided optimized for various contract manufacturers:
 
-Bill of Materials (AdvancedCircuits): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-AdvancedCircuits.csv
-Bill of Materials (AllPCB): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-AllPCB.csv
-Bill of Materials (Elecrow): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-Elecrow.csv
-Bill of Materials (Eurocircuits): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-Eurocircuits.csv
-Bill of Materials (Flux): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-Flux.csv
-Bill of Materials (JLCPCB): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-JLCPCB.csv
-Bill of Materials (PCBWay): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-PCBWay.csv
-Bill of Materials (Seeed): BOM/jdtommy-status-indicator-copy-BOM-V1ef73905-Seeed.csv
+Bill of Materials (AdvancedCircuits): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-AdvancedCircuits.csv
+Bill of Materials (AllPCB): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-AllPCB.csv
+Bill of Materials (Elecrow): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-Elecrow.csv
+Bill of Materials (Eurocircuits): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-Eurocircuits.csv
+Bill of Materials (Flux): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-Flux.csv
+Bill of Materials (JLCPCB): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-JLCPCB.csv
+Bill of Materials (PCBWay): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-PCBWay.csv
+Bill of Materials (Seeed): BOM/jdtommy-status-indicator-copy-BOM-Vba6d84cb-Seeed.csv
 

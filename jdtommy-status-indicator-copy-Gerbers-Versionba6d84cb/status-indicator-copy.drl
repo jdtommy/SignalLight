@@ -1,7 +1,7 @@
 M48
-; DRILL file Flux date 2026-09-25T08:37:17
+; DRILL file Flux date 2026-10-01T18:50:59
 ; FORMAT={-:-/ absolute / metric / decimal}
-; #@! TF.CreationDate,2026-09-25T08:37:17+00:00
+; #@! TF.CreationDate,2026-10-01T18:50:59+00:00
 ; #@! TF.GenerationSoftware,Flux,Flux PCB Export,1
 ; #@! TF.FileFunction,MixedPlating,1,2
 FMAT,2
@@ -18,14 +18,17 @@ T4C1.860
 G90
 G05
 T1
-X33.173Y-19.435
+X32.207Y-48.726
+X39.206Y-12.539
 T2
 X17.538Y-13.17
 X17.538Y-15.67
 X17.538Y-18.17
 X17.538Y-20.67
 X44.997Y-15.67
+X44.997Y-24.849
 X44.998Y-18.21
+X44.998Y-27.389
 T3
 X25.512Y-15.63
 X25.512Y-18.17
