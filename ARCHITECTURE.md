@@ -128,7 +128,9 @@ Scenario B: PC Power Off / Prolonged Absence (> 45s)
 - `name` (`String`): Advertised device name (e.g. `"Office Desk"`).
 - `secret` (`String`): Shared authorization secret.
 - `active_color` (`char`): Last active user color (`'R'`, `'G'`, `'Y'`, `'0'`). Restored on boot.
-- `rst_armed` (`bool`): Set `true` during first 4 seconds of boot. If another reset occurs while `true`, triggers a factory reset.
+
+### Physical Unpair Button (`D5`)
+A momentary button from `D5` to GND (`INPUT_PULLUP`, 50ms debounce). Holding it freezes the LEDs on solid red; after 10 seconds the light flashes red 3 times and factory resets (same `factoryReset()` as the `UNPAIR` command). Releasing early cancels and restores `activeColor`. This replaced an older reset-button double-press scheme (`rst_armed` flash flag), which could be falsely triggered by any quick power cycle and wrote to flash on every boot.
 
 ### Two-Tier Color Architecture
 ```

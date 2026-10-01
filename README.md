@@ -58,6 +58,9 @@ To keep Yellow ON when the Arduino is disconnected or powered off:
 
 Board outline is roughly **19mm × 45mm**.
 
+> [!IMPORTANT]
+> **Needed in the next board revision: an unpair button on `D5`.** The firmware now uses a momentary button from `D5` to GND (internal pull-up, so no external resistor) as the physical factory-reset control: hold it 10 seconds to unpair. The current board (`Version1ef73905`) has no footprint for it. Add a 2-pin tactile switch, or a 2-pin JST XH header for a panel-mount button, between `D5` and GND before ordering. Until then, the button can be wired directly to the Nano's `D5` and `GND` pins, or you can unpair from the dashboard or by typing `UNPAIR` in the serial monitor.
+
 > [!NOTE]
 > **Bare PCB fabrication: ready to order.** `jdtommy-status-indicator-Gerbers-Version1ef73905/` has properly formatted Gerber X2 files for all layers, a real Excellon drill file, and an IPC-D-356 bare-board test netlist — this is a standard fab package any house (JLCPCB, PCBWay, OSH Park, etc.) should accept directly. (The DXF/SVG folders are just plot previews from an earlier export and aren't needed for ordering.)
 >

@@ -49,7 +49,7 @@
 - **Factory Reset Options:**
   1. Write `UNPAIR` to Auth characteristic.
   2. Send `FACTORY_RESET` over USB Serial.
-  3. Physical Double-Press: Press hardware reset button twice within 4 seconds of boot (`rst_armed` flag in flash).
+  3. Physical Unpair Button: Hold the momentary button on `D5` (to GND, `INPUT_PULLUP`) for 10 seconds. The light shows solid red while held (all other display changes are frozen), then flashes red 3 times and factory resets. Releasing early cancels and restores `activeColor`. (This replaced an older reset-button double-press scheme, which could be falsely triggered by any quick power cycle.)
 
 ### Control Commands (`19B10001`)
 | Command Byte | Description | Behavior |
@@ -127,5 +127,5 @@ To eliminate flickering and unintended fallback to Yellow, the firmware maintain
 ### 3. Modifying Windows BLE Client
 - BLE client location: [`windows/ble/client.go`](file:///C:/Users/jdtom/dev/SignalLight/windows/ble/client.go).
 - Default `lastSentColor` must remain `'G'` (`GREEN`), never `'Y'`.
-- WinRT write operations: Use `writeControl` which attempts acknowledged `Write` first, with graceful fallback to `WriteWithoutResponse`.
+- WinRT write operations: Use `writeControl`, which uses acknowledged `Write` only. **Do not add a `WriteWithoutResponse` fallback**: WinRT reports success for it even when the peripheral is disconnected, which previously masked real write failures and caused up to 60s of stuck Yellow.
 - Always verify COM apartment initialization (`runtime.LockOSThread()`, `ole.RoInitialize(1)`) on any new goroutines interacting with WinRT.

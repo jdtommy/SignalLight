@@ -6,13 +6,15 @@
  *   - Pin D2: RED LED (In Meeting / Busy)
  *   - Pin D3: YELLOW LED (Away / Default)
  *   - Pin D4: GREEN LED (Available / Free)
- * 
+ *   - Pin D5: Unpair button (momentary, to GND, internal pull-up)
+ *
  * Identity & Security:
  *   - Unpaired: Advertises as "SignalLight-[Last 4 MAC]" (e.g. SignalLight-69F5).
  *               Yellow LED pulses to indicate awaiting pairing.
  *   - Paired:   Advertises with custom name (e.g. "Office Desk").
  *               Requires "AUTH:<secret>" handshake within 4s of connection.
- *   - Reset:    Press the physical Reset button TWICE within 3s to factory reset.
+ *   - Reset:    Hold the D5 unpair button for 10s (light shows solid red while held,
+ *               then flashes red 3 times and factory resets). Releasing early cancels.
  *               Or write "UNPAIR" from the app, or type "FACTORY_RESET" in Serial.
  */
 
@@ -24,6 +26,7 @@
 const int PIN_RED    = D2;
 const int PIN_YELLOW = D3;
 const int PIN_GREEN  = D4;
+const int PIN_UNPAIR_BUTTON = D5; // Momentary button to GND; INPUT_PULLUP, so pressed reads LOW
 
 // On-board RGB LED is defined by Arduino Nano ESP32 core (LED_RED, LED_GREEN, LED_BLUE: Active-LOW)
 
@@ -42,6 +45,13 @@ bool isPaired = false;
 String deviceName = "";
 String sharedSecret = "";
 
+// Must be a global, never modified after BLE.setLocalName(): ArduinoBLE stores the raw
+// pointer instead of copying the string, and re-reads it every time advertising is
+// rebuilt (each BLE.advertise(), e.g. after a disconnect). A local String in setup()
+// is freed when setup() returns, so later advertisements carried a garbage name and
+// the dashboard's scan couldn't find the device until it was rebooted.
+String advertisedName = "";
+
 // Security & Connection State
 BLEDevice activeCentral;
 bool isCentralConnected = false;
@@ -58,9 +68,14 @@ unsigned long lastHeartbeatTime = 0;
 char activeColor = 'G';     // The desired operational color (survives disconnects)
 char displayedColor = ' ';  // The actual color currently illuminated on the LEDs
 
-// Double-press reset detection via flash (survives power cycles and EN pin reset)
-unsigned long bootTime = 0;
-bool resetArmed = false;
+// Unpair button (hold to factory reset)
+const unsigned long UNPAIR_HOLD_MS      = 10000; // Hold time required to factory reset
+const unsigned long BUTTON_DEBOUNCE_MS  = 50;
+bool unpairHoldActive = false;      // True while the button is held; freezes the display on red
+bool buttonDown = false;            // Debounced button state
+bool lastRawButtonDown = false;
+unsigned long lastRawButtonChange = 0;
+unsigned long buttonPressStart = 0;
 
 // Control the onboard RGB LED (active-LOW logic) and onboard Yellow LED (LED_BUILTIN)
 void setOnboardRGB(bool redOn, bool greenOn, bool blueOn) {
@@ -87,6 +102,13 @@ void flashLED(int pin, int times, int delayMs) {
 }
 
 void applyColor(char c) {
+  // While the unpair button is held, the LEDs are frozen on red. Incoming commands
+  // still update activeColor (via setActiveColor), so the right color is restored if
+  // the hold is cancelled — they just don't reach the LEDs until then. This also keeps
+  // the watchdog from overwriting the red mid-hold.
+  if (unpairHoldActive) {
+    return;
+  }
   if (displayedColor == c) {
     return; // Already showing this color; prevent flicker, flash wear, and log spam
   }
@@ -158,6 +180,50 @@ void factoryReset() {
   BLE.end();
   delay(100);
   ESP.restart();
+}
+
+void showUnpairHoldRed() {
+  digitalWrite(PIN_YELLOW, LOW);
+  digitalWrite(PIN_GREEN, LOW);
+  digitalWrite(PIN_RED, HIGH);
+  setOnboardRGB(true, false, false);
+}
+
+// Non-blocking: called every loop(). Hold the button for UNPAIR_HOLD_MS to factory
+// reset; the light shows solid red the whole time it's held. Releasing early cancels
+// and restores whatever color is currently active.
+void handleUnpairButton() {
+  unsigned long t = millis();
+  bool rawDown = digitalRead(PIN_UNPAIR_BUTTON) == LOW;
+
+  if (rawDown != lastRawButtonDown) {
+    lastRawButtonDown = rawDown;
+    lastRawButtonChange = t;
+  }
+
+  if (t - lastRawButtonChange >= BUTTON_DEBOUNCE_MS && rawDown != buttonDown) {
+    buttonDown = rawDown;
+    if (buttonDown) {
+      buttonPressStart = t;
+      unpairHoldActive = true;
+      showUnpairHoldRed();
+      Serial.println("[Reset] Unpair button held. Keep holding for 10s to factory reset...");
+    } else if (unpairHoldActive) {
+      unpairHoldActive = false;
+      displayedColor = ' '; // Force applyColor to re-drive the LEDs
+      applyColor(isPaired ? activeColor : 'Y');
+      Serial.println("[Reset] Unpair button released early. Cancelled.");
+    }
+  }
+
+  if (unpairHoldActive && t - buttonPressStart >= UNPAIR_HOLD_MS) {
+    Serial.println("[Reset] Unpair button held for 10s. Factory resetting...");
+    // Turn the solid red off briefly so the 3 confirmation flashes read as distinct.
+    digitalWrite(PIN_RED, LOW);
+    setOnboardRGB(false, false, false);
+    delay(400);
+    factoryReset(); // Flashes red 3 times, wipes flash, reboots unpaired
+  }
 }
 
 void processControlCommand(char cmd) {
@@ -250,7 +316,6 @@ void processAuthMessage(String msg) {
     prefs.putBool("paired", true);
     prefs.putString("name", newName);
     prefs.putString("secret", newSecret);
-    prefs.putBool("rst_armed", false);
     prefs.putChar("active_color", 'G');
     prefs.end();
 
@@ -358,44 +423,21 @@ void setup() {
   pinMode(LED_BLUE, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
+  pinMode(PIN_UNPAIR_BUTTON, INPUT_PULLUP);
+
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=========================================");
   Serial.println("SignalLight Controller (Nano ESP32)");
 
-  // 1. Double-Press Reset Detection via Flash
-  prefs.begin("signallight", false);
-  bool wasArmed = prefs.getBool("rst_armed", false);
-  if (wasArmed) {
-    // Reset occurred while rst_armed was true (user pressed Reset button twice within 4s)
-    Serial.println("[Reset] DOUBLE-PRESS DETECTED! Resetting to factory defaults...");
-    prefs.clear();
-    prefs.putBool("rst_armed", false);
-    prefs.end();
-
-    // Flash RED 3 times
-    digitalWrite(PIN_YELLOW, LOW);
-    digitalWrite(PIN_GREEN, LOW);
-    flashLED(PIN_RED, 3, 150);
-
-    Serial.println("[Reset] Factory reset complete. Continuing boot in unpaired mode...");
-    bootTime = millis();
-    resetArmed = false;
-  } else {
-    prefs.putBool("rst_armed", true);
-    prefs.end();
-    bootTime = millis();
-    resetArmed = true;
-  }
-
-  // 2. Read Factory Hardware MAC Address directly from eFuse
+  // 1. Read Factory Hardware MAC Address directly from eFuse
   uint8_t baseMac[6];
   esp_read_mac(baseMac, ESP_MAC_BT);
   char macSuffix[5];
   snprintf(macSuffix, sizeof(macSuffix), "%02X%02X", baseMac[4], baseMac[5]);
   String defaultName = "SignalLight-" + String(macSuffix);
 
-  // 3. Load Saved Settings from Flash
+  // 2. Load Saved Settings from Flash
   prefs.begin("signallight", false);
   isPaired = prefs.getBool("paired", false);
   deviceName = prefs.getString("name", "");
@@ -411,22 +453,22 @@ void setup() {
     applyColor('Y');
   }
 
-  String activeName = defaultName;
+  advertisedName = defaultName;
   if (isPaired && deviceName.length() > 0) {
-    activeName = deviceName;
+    advertisedName = deviceName;
   }
 
   Serial.print("[Config] Status: ");
   Serial.println(isPaired ? "PAIRED" : "UNPAIRED");
   Serial.print("[Config] Advertising Name: ");
-  Serial.println(activeName);
+  Serial.println(advertisedName);
 
-  // 4. Initialize BLE (Only ONCE)
+  // 3. Initialize BLE (Only ONCE)
   if (!BLE.begin()) {
     Serial.println("ERR: BLE.begin() failed!");
   } else {
-    BLE.setLocalName(activeName.c_str());
-    BLE.setDeviceName(activeName.c_str());
+    BLE.setLocalName(advertisedName.c_str());
+    BLE.setDeviceName(advertisedName.c_str());
     BLE.setAdvertisedService(lightService);
 
     lightService.addCharacteristic(lightCharacteristic);
@@ -450,14 +492,8 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. Disarm double-press reset detection after 4 seconds of stable uptime
-  if (resetArmed && (now - bootTime > 4000)) {
-    prefs.begin("signallight", false);
-    prefs.putBool("rst_armed", false);
-    prefs.end();
-    resetArmed = false;
-    Serial.println("[Reset] Double-press window expired. Reset disarmed.");
-  }
+  // 1. Unpair button (hold 10s to factory reset)
+  handleUnpairButton();
 
   // 2. Poll BLE stack
   BLE.poll();
@@ -509,8 +545,9 @@ void loop() {
     }
   }
 
-  // 8. Visual Pulse when Unpaired and Awaiting Connection
-  if (!isPaired && !isCentralConnected) {
+  // 8. Visual Pulse when Unpaired and Awaiting Connection (paused while the unpair
+  // button is held, since this writes the LEDs directly rather than via applyColor)
+  if (!isPaired && !isCentralConnected && !unpairHoldActive) {
     unsigned long cycle = now % PULSE_CYCLE_MS;
     if (cycle < PULSE_ON_MS) {
       digitalWrite(PIN_YELLOW, HIGH);
