@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"log"
@@ -17,6 +19,8 @@ import (
 
 	"signallight/ble"
 	"signallight/config"
+	"signallight/firmware"
+	"signallight/ota"
 	"signallight/state"
 )
 
@@ -24,7 +28,8 @@ type Server struct {
 	addr       string
 	stateMgr   *state.Manager
 	bleClient  *ble.Client
-	zoomSecret string // Optional Zoom webhook secret token
+	updater    *firmware.Updater // nil without Bluetooth
+	zoomSecret string            // Optional Zoom webhook secret token
 	mux        *http.ServeMux
 	httpServer *http.Server
 }
@@ -42,6 +47,9 @@ func NewServer(addr string, stateMgr *state.Manager, bleClient *ble.Client, zoom
 		bleClient:  bleClient,
 		zoomSecret: zoomSecret,
 		mux:        http.NewServeMux(),
+	}
+	if bleClient != nil {
+		s.updater = firmware.NewUpdater(bleClient)
 	}
 	s.routes()
 	s.httpServer = &http.Server{
@@ -84,6 +92,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/ble/scan", sameOriginOnly(s.handleBLEScan))
 	s.mux.HandleFunc("/api/ble/pair", sameOriginOnly(s.handleBLEPair))
 	s.mux.HandleFunc("/api/ble/unpair", sameOriginOnly(s.handleBLEUnpair))
+	s.mux.HandleFunc("/api/firmware", s.handleFirmwareStatus)
+	s.mux.HandleFunc("/api/firmware/check", sameOriginOnly(s.handleFirmwareCheck))
+	s.mux.HandleFunc("/api/firmware/install", sameOriginOnly(s.handleFirmwareInstall))
+	s.mux.HandleFunc("/api/firmware/upload", sameOriginOnly(s.handleFirmwareUpload))
 	s.mux.HandleFunc("/webhook/zoom", s.handleZoomWebhook)
 }
 
@@ -303,6 +315,73 @@ func (s *Server) handleBLEUnpair(w http.ResponseWriter, r *http.Request) {
 	_ = config.Clear()
 
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+var errNoBluetooth = errors.New("firmware updates need Bluetooth, which is turned off (-ble=false)")
+
+// handleFirmwareStatus reports the light's firmware, the latest published
+// firmware, and the progress of any update. While the dashboard polls this, the
+// app checks GitHub for new firmware every few hours.
+func (s *Server) handleFirmwareStatus(w http.ResponseWriter, r *http.Request) {
+	if s.updater == nil {
+		jsonError(w, http.StatusServiceUnavailable, errNoBluetooth)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.updater.Status())
+}
+
+func (s *Server) handleFirmwareCheck(w http.ResponseWriter, r *http.Request) {
+	if !s.firmwarePOST(w, r) {
+		return
+	}
+	s.updater.CheckNow()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.updater.Status())
+}
+
+// handleFirmwareInstall installs the latest published firmware.
+func (s *Server) handleFirmwareInstall(w http.ResponseWriter, r *http.Request) {
+	if !s.firmwarePOST(w, r) {
+		return
+	}
+	if err := s.updater.InstallLatest(); err != nil {
+		jsonError(w, http.StatusConflict, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.updater.Status())
+}
+
+// handleFirmwareUpload installs a firmware image sent as the raw request body
+// (e.g. a local SignalLight.ino.bin build).
+func (s *Server) handleFirmwareUpload(w http.ResponseWriter, r *http.Request) {
+	if !s.firmwarePOST(w, r) {
+		return
+	}
+	image, err := io.ReadAll(http.MaxBytesReader(w, r.Body, ota.MaxImageSize))
+	if err != nil {
+		jsonError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("firmware file is too large (max %d bytes)", ota.MaxImageSize))
+		return
+	}
+	if err := s.updater.InstallImage(image); err != nil {
+		jsonError(w, http.StatusConflict, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.updater.Status())
+}
+
+func (s *Server) firmwarePOST(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	if s.updater == nil {
+		jsonError(w, http.StatusServiceUnavailable, errNoBluetooth)
+		return false
+	}
+	return true
 }
 
 // verifyZoomSignature validates Zoom's per-request HMAC (x-zm-signature /
@@ -644,6 +723,25 @@ const dashboardHTML = `<!DOCTYPE html>
         .btn-cancel { background: #334155; padding: 8px 14px; font-size: 0.85rem; }
         .btn-confirm { background: var(--green); padding: 8px 14px; font-size: 0.85rem; }
 
+        .fw-panel {
+            margin-top: 8px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+        .fw-msg { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 6px; overflow-wrap: anywhere; }
+        .fw-msg.ok { color: var(--green); }
+        .fw-msg.err { color: var(--red); }
+        .fw-progress { height: 8px; background: #090d16; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+        #fw-bar { height: 100%; width: 0; background: var(--blue); transition: width 0.3s; }
+        .fw-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+        .btn-fw { background: var(--blue); padding: 6px 12px; font-size: 0.8rem; border-radius: 8px; }
+        .btn-link { background: none; color: var(--text-dim); padding: 4px 0; font-size: 0.75rem; text-decoration: underline; }
+        .btn-link:hover { color: var(--text); transform: none; }
+        button:disabled { opacity: 0.5; cursor: default; }
+        [hidden] { display: none !important; }
+
         .shortcuts {
             color: var(--text-dim);
             font-size: 0.75rem;
@@ -712,6 +810,17 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="device-detail">MAC Address: <strong id="cfg-mac">-</strong></div>
                 <div class="device-detail">Security: <strong id="cfg-sec">Shared Secret Handshake</strong></div>
                 <div class="device-detail">Firmware: <strong id="cfg-fw">-</strong></div>
+                <div id="fw-panel" class="fw-panel" hidden>
+                    <div id="fw-result" class="fw-msg" hidden></div>
+                    <div id="fw-msg" class="fw-msg"></div>
+                    <div id="fw-progress" class="fw-progress" hidden><div id="fw-bar"></div></div>
+                    <div class="fw-actions">
+                        <button id="fw-install" class="btn-fw" onclick="installLatest()" hidden>Update</button>
+                        <button id="fw-check" class="btn-link" onclick="checkFirmware()">Check for updates</button>
+                        <button id="fw-pick" class="btn-link" onclick="document.getElementById('fw-file').click()">Install from file…</button>
+                        <input type="file" id="fw-file" accept=".bin" hidden onchange="uploadFirmware(this)">
+                    </div>
+                </div>
                 <div class="device-actions">
                     <button class="btn-unpair" onclick="unpairLight()">Unpair / Reset Light</button>
                 </div>
@@ -770,7 +879,9 @@ const dashboardHTML = `<!DOCTYPE html>
                 const res = await fetch('/api/ble/config');
                 const cfg = await res.json();
                 const badge = document.getElementById('device-paired-badge');
-                if (cfg.paired && cfg.target_mac) {
+                isPaired = !!(cfg.paired && cfg.target_mac);
+                fetchFirmware();
+                if (isPaired) {
                     badge.className = 'badge-paired';
                     badge.innerText = 'PAIRED';
                     document.getElementById('device-info-paired').style.display = 'block';
@@ -935,7 +1046,120 @@ const dashboardHTML = `<!DOCTYPE html>
             }
         }
 
+        // Firmware updates. Only polled while a light is paired, so the app doesn't
+        // check GitHub for firmware nobody can install.
+        let isPaired = false;
+        let fwError = '';   // Error from the last button press, shown until the next one
+        let fwLatest = null;
+
+        async function fetchFirmware() {
+            const panel = document.getElementById('fw-panel');
+            if (!isPaired) { panel.hidden = true; return; }
+            try {
+                const res = await fetch('/api/firmware');
+                if (!res.ok) { panel.hidden = true; return; }
+                panel.hidden = false;
+                renderFirmware(await res.json());
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function renderFirmware(fw) {
+            const job = fw.job || {};
+            const busy = ['downloading', 'installing', 'rebooting'].includes(job.state);
+            const msg = document.getElementById('fw-msg');
+            const result = document.getElementById('fw-result');
+            const install = document.getElementById('fw-install');
+            const progress = document.getElementById('fw-progress');
+            fwLatest = fw.latest || null;
+
+            document.getElementById('fw-check').disabled = busy || fw.checking;
+            document.getElementById('fw-pick').disabled = busy || !fw.can_update;
+            install.hidden = true;
+            progress.hidden = !busy;
+
+            // Outcome of the last update (or button press). Built with textContent:
+            // messages can include error text from the light or the network.
+            let resultText = fwError, resultClass = 'err';
+            if (!fwError && (job.state === 'done' || job.state === 'failed')) {
+                resultText = job.message;
+                resultClass = job.state === 'done' ? 'ok' : 'err';
+            }
+            result.hidden = busy || !resultText;
+            result.className = 'fw-msg ' + resultClass;
+            result.textContent = resultText || '';
+
+            if (busy) {
+                const pct = job.total ? Math.floor(job.done * 100 / job.total) : 0;
+                document.getElementById('fw-bar').style.width = (job.state === 'downloading' ? 0 : pct) + '%';
+                msg.textContent = job.state === 'downloading' ? 'Downloading firmware' + (job.target ? ' ' + job.target : '') + '…'
+                    : job.state === 'installing' ? 'Installing on the light… ' + pct + '%. Keep the light powered and nearby.'
+                    : 'Installed. Waiting for the light to restart…';
+                return;
+            }
+
+            const v = fw.latest && fw.latest.version;
+            if (!fw.can_update) {
+                msg.textContent = fw.current
+                    ? "This light's firmware can't update over Bluetooth. Flash it over USB once to enable updates."
+                    : 'Connect the light to update its firmware.';
+            } else if (v && fw.update_available) {
+                msg.textContent = 'Version ' + v + ' is available.';
+                install.textContent = 'Update to ' + v;
+                install.hidden = false;
+            } else if (v && !fw.current_known) {
+                msg.textContent = 'This light runs a development build. Latest release: ' + v + '.';
+                install.textContent = 'Install ' + v;
+                install.hidden = false;
+            } else if (v) {
+                msg.textContent = 'Up to date (latest release: ' + v + ').';
+            } else if (fw.checking) {
+                msg.textContent = 'Checking for updates…';
+            } else if (fw.check_error) {
+                msg.textContent = "Couldn't check for updates: " + fw.check_error;
+            } else {
+                msg.textContent = 'No firmware has been published yet.';
+            }
+        }
+
+        async function firmwareRequest(url, options) {
+            fwError = '';
+            try {
+                const res = await fetch(url, Object.assign({ method: 'POST' }, options));
+                const data = await res.json();
+                if (!res.ok || data.error) {
+                    fwError = data.error || ('Request failed: ' + res.status);
+                }
+            } catch (e) {
+                fwError = 'Request failed: ' + e;
+            }
+            fetchFirmware();
+        }
+
+        function checkFirmware() {
+            firmwareRequest('/api/firmware/check');
+        }
+
+        function installLatest() {
+            if (!fwLatest) return;
+            if (!confirm('Update the light to firmware ' + fwLatest.version + '?\n\nIt takes about 10 seconds. The light keeps its color, then restarts.')) return;
+            firmwareRequest('/api/firmware/install');
+        }
+
+        function uploadFirmware(input) {
+            const file = input.files[0];
+            input.value = '';
+            if (!file) return;
+            if (!confirm('Install "' + file.name + '" on the light?\n\nUse the SignalLight.ino.bin file from an Arduino build. If the new firmware can\'t connect, the light returns to its current firmware within 5 minutes.')) return;
+            firmwareRequest('/api/firmware/upload', {
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: file
+            });
+        }
+
         setInterval(fetchStatus, 1000);
+        setInterval(fetchFirmware, 1000);
         fetchStatus();
         fetchConfig();
     </script>

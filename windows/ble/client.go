@@ -8,10 +8,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-ole/go-ole"
 	"tinygo.org/x/bluetooth"
+
+	"signallight/ota"
 )
 
 var (
@@ -34,7 +37,10 @@ type Client struct {
 	char          *bluetooth.DeviceCharacteristic
 	authChar      *bluetooth.DeviceCharacteristic
 	versionChar   *bluetooth.DeviceCharacteristic
-	fwVersion     string // Firmware version of the connected light; "" if unknown
+	fwVersion     string    // Firmware version of the connected light; "" if unknown
+	otaChars      *otaChars // Update characteristics of the connected light; nil on older firmware
+	updateReq     chan updateRequest
+	updating      atomic.Bool
 	mu            sync.Mutex
 	scanMu        sync.Mutex
 	connected     bool
@@ -60,6 +66,7 @@ func NewClient(targetMAC, targetName, sharedSecret string, onConnect func(), onD
 		onDisconnect:  onDisconnect,
 		stopChan:      make(chan struct{}),
 		sendChan:      make(chan byte, 32),
+		updateReq:     make(chan updateRequest),
 		targetMAC:     strings.ToUpper(strings.TrimSpace(targetMAC)),
 		targetName:    strings.TrimSpace(targetName),
 		sharedSecret:  strings.TrimSpace(sharedSecret),
@@ -175,6 +182,85 @@ func (c *Client) FirmwareVersion() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.fwVersion
+}
+
+// ErrUpdateUnsupported means the connected light's firmware predates Bluetooth updates.
+var ErrUpdateUnsupported = errors.New("this light's firmware doesn't support Bluetooth updates yet; flash it over USB once")
+
+type otaChars struct {
+	control, status, data bluetooth.DeviceCharacteristic
+}
+
+type updateRequest struct {
+	image    []byte
+	progress func(done, total int)
+	done     chan error
+}
+
+// CanUpdateFirmware reports whether a light is connected whose firmware supports
+// Bluetooth updates.
+func (c *Client) CanUpdateFirmware() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected && c.authenticated && c.otaChars != nil
+}
+
+// UpdateFirmware sends image to the connected light and returns once the light has
+// verified and installed it (it then reboots, and the client reconnects, which
+// also confirms the new firmware on the light). progress may be nil. Blocks for
+// the whole transfer, about 10 seconds.
+func (c *Client) UpdateFirmware(image []byte, progress func(done, total int)) error {
+	if !c.updating.CompareAndSwap(false, true) {
+		return errors.New("a firmware update is already in progress")
+	}
+	defer c.updating.Store(false)
+
+	c.mu.Lock()
+	ready, supported := c.connected && c.authenticated, c.otaChars != nil
+	c.mu.Unlock()
+	if !ready {
+		return errors.New("the light isn't connected")
+	}
+	if !supported {
+		return ErrUpdateUnsupported
+	}
+
+	req := updateRequest{image: image, progress: progress, done: make(chan error, 1)}
+	select {
+	case c.updateReq <- req: // Picked up by the connection loop
+	case <-time.After(10 * time.Second):
+		return errors.New("the light's connection is busy; try again")
+	}
+	return <-req.done
+}
+
+func (c *Client) runUpdate(sess **ota.Session, req updateRequest) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered from firmware update panic: %v", r)
+		}
+	}()
+	if *sess == nil {
+		c.mu.Lock()
+		oc := c.otaChars
+		c.mu.Unlock()
+		if oc == nil {
+			return ErrUpdateUnsupported
+		}
+		s, err := ota.NewSession(oc.control, oc.status, oc.data)
+		if err != nil {
+			return err
+		}
+		*sess = s
+	}
+	log.Printf("[BLE] Sending firmware update (%d bytes)...", len(req.image))
+	start := time.Now()
+	if err := (*sess).Send(req.image, req.progress); err != nil {
+		log.Printf("[BLE] Firmware update failed: %v", err)
+		return err
+	}
+	log.Printf("[BLE] Light verified and installed the firmware in %v.", time.Since(start).Round(100*time.Millisecond))
+	return nil
 }
 
 func (c *Client) IsConnected() bool {
@@ -440,6 +526,7 @@ func (c *Client) UnpairCurrent() (err error) {
 	c.authChar = nil
 	c.versionChar = nil
 	c.fwVersion = ""
+	c.otaChars = nil
 	c.mu.Unlock()
 
 	return nil
@@ -695,6 +782,7 @@ func (c *Client) runSession(device *bluetooth.Device, lightChar *bluetooth.Devic
 	c.authChar = nil
 	c.versionChar = nil
 	c.fwVersion = ""
+	c.otaChars = nil
 	c.mu.Unlock()
 
 	log.Printf("[BLE] Disconnected from device.")
@@ -806,6 +894,13 @@ func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar, a
 		}
 
 		if lightChar != nil && authChar != nil {
+			var oc *otaChars
+			if control, status, data, ok := ota.Find(chars); ok {
+				oc = &otaChars{control, status, data}
+			}
+			c.mu.Lock()
+			c.otaChars = oc
+			c.mu.Unlock()
 			return lightChar, authChar, versionChar, nil
 		}
 		err = fmt.Errorf("control/auth characteristics not found (attempt %d/3)", attempt)
@@ -983,6 +1078,7 @@ func (c *Client) connectionLoop(device *bluetooth.Device, char *bluetooth.Device
 
 	heartbeatCounter := 0
 	mismatchStreak := 0
+	var otaSess *ota.Session // Created on first update; subscribes to notifications once per connection
 
 	for {
 		select {
@@ -991,6 +1087,16 @@ func (c *Client) connectionLoop(device *bluetooth.Device, char *bluetooth.Device
 		case <-cancelChan:
 			log.Println("[BLE] Connection loop aborted by link loss event.")
 			return
+		case req := <-c.updateReq:
+			// Runs here, on the session's WinRT thread, so heartbeats pause for the
+			// ~10s transfer instead of competing with it. The light ignores color
+			// changes while updating and its watchdog allows 60s.
+			err := c.runUpdate(&otaSess, req)
+			req.done <- err
+			if err == nil {
+				log.Println("[BLE] Light installed the update and is rebooting; reconnecting...")
+				return
+			}
 		case cmd := <-c.sendChan:
 			err := c.writeControl(char, cmd)
 			if err != nil {

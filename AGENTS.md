@@ -110,7 +110,10 @@ To eliminate flickering and unintended fallback to Yellow, the firmware maintain
   - `Ctrl + Shift + A`: Auto Mode (Resume Zoom/Lock sync)
 - **Web Dashboard & REST API (`windows/server/server.go`):**
   - Serves status dashboard and pairing UI at `http://localhost:<dynamic_port>` (saved in `%APPDATA%\SignalLight\config.json`).
-  - Endpoints: `GET /api/status`, `POST /api/set?color=...`, `GET /api/ble/scan`, `POST /api/ble/pair`, `POST /api/ble/unpair`.
+  - Endpoints: `GET /api/status`, `POST /api/set?color=...`, `GET /api/ble/scan`, `POST /api/ble/pair`, `POST /api/ble/unpair`, `GET /api/firmware`, `POST /api/firmware/check`, `POST /api/firmware/install`, `POST /api/firmware/upload` (raw `.bin` body).
+- **Firmware Updates (`windows/firmware/`, `windows/ota/`):**
+  - `firmware.Updater` finds the newest GitHub release with `signallight-firmware-<version>.bin` + `.sha256`, verifies the download, and runs the install job. It only contacts GitHub while the dashboard is polling `/api/firmware` (at most every 6 hours, or on "Check for updates"). That's the app's only internet access; keep `PRIVACY.md` accurate if this changes.
+  - The transfer runs inside `ble.Client`'s `connectionLoop` (via `UpdateFirmware`), on the session's WinRT thread, so heartbeats pause during it. After success the loop returns so the client reconnects; the reconnect's `AUTH` is what confirms the new firmware on the light.
 
 ---
 
