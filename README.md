@@ -187,6 +187,19 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 - [x] **Automated release signing**: pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which tests, builds, signs, and verifies `signallight.exe`, then attaches it to a **draft** release. Review the notes and publish. Azure sign-in uses GitHub OIDC, so no Azure secret is stored in GitHub.
 - [x] **Installer**: signed per-user Inno Setup installer ([`installer/SignalLight.iss`](installer/SignalLight.iss)), built by the release workflow.
 
+**Firmware updates over Bluetooth** (click-to-update from the dashboard; design and rationale in [docs/FIRMWARE_UPDATES.md](docs/FIRMWARE_UPDATES.md)):
+- [ ] Prototype BLE transfer throughput on ArduinoBLE (decides whether to migrate to NimBLE first)
+- [ ] Firmware reports its version; dashboard shows it
+- [ ] Release workflow compiles the firmware with `arduino-cli` and attaches the `.bin` + SHA-256
+- [ ] Firmware update receiver: chunk/ack protocol, `Update` library, "updating" LED pattern, rollback self-check
+- [ ] Windows update client + dashboard UI: GitHub check, manual `.bin` upload, progress, retry
+- [ ] (Optional) USB recovery flashing via `dfu-util`
+
+**Later:**
+- [ ] Firmware signing (CI signs, light verifies before switching)
+- [ ] Windows app self-update from GitHub Releases
+- [ ] Automatic idle-time firmware updates
+
 ---
 
 ## 🔗 Optional: Zoom Webhook Integration
