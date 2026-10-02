@@ -184,13 +184,13 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 
 ## 📋 Future Roadmap & TODO
 - [x] **Binary Code Signing**: `signallight.exe` attached to GitHub Releases is signed via [Azure Trusted Signing](https://azure.microsoft.com/en-us/products/artifact-signing) (Public Trust, individual developer), so it should run under Smart App Control without a warning.
-- [x] **Automated release signing**: pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which tests, builds, signs, and verifies `signallight.exe`, then attaches it to a **draft** release. Review the notes and publish. Azure sign-in uses GitHub OIDC, so no Azure secret is stored in GitHub.
+- [x] **Automated release signing**: pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which tests, builds, signs, and verifies `signallight.exe` and the installer, compiles the light's firmware, then attaches them all to a **draft** release. Review the notes and publish. Azure sign-in uses GitHub OIDC, so no Azure secret is stored in GitHub.
 - [x] **Installer**: signed per-user Inno Setup installer ([`installer/SignalLight.iss`](installer/SignalLight.iss)), built by the release workflow.
 
 **Firmware updates over Bluetooth** (click-to-update from the dashboard; design and rationale in [docs/FIRMWARE_UPDATES.md](docs/FIRMWARE_UPDATES.md)):
 - [x] Prototype BLE transfer throughput on ArduinoBLE: ~47 KB/s with flash writes, so the ~469KB firmware takes ~10s; no NimBLE migration needed
 - [x] Firmware reports its version (read-only characteristic `19B10003`); dashboard shows it
-- [ ] Release workflow compiles the firmware with `arduino-cli` and attaches the `.bin` + SHA-256
+- [x] Release workflow compiles the firmware with `arduino-cli` and attaches `signallight-firmware-<version>.bin` + `.sha256`
 - [ ] Firmware update receiver: chunk/ack protocol, `Update` library, "updating" LED pattern, rollback self-check
 - [ ] Windows update client + dashboard UI: GitHub check, manual `.bin` upload, progress, retry
 - [ ] (Optional) USB recovery flashing via `dfu-util`
