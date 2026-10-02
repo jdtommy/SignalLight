@@ -14,8 +14,14 @@ The Arduino Nano ESP32 operates as a **GATT Server (Peripheral)**, and the Windo
 Service: 19B10000-E8F2-537E-4F6C-D104768A1214
  ├── Characteristic 19B10001 (Control) [Read | Write | WriteWithoutResponse | Notify] (1 byte)
  ├── Characteristic 19B10002 (Auth)    [Read | Write | Notify] (UTF-8 String, max 64 bytes)
- └── Characteristic 19B10003 (Version) [Read] (UTF-8 String, max 32 bytes)
+ ├── Characteristic 19B10003 (Version) [Read] (UTF-8 String, max 32 bytes)
+ ├── Characteristic 19B10004 (Update control) [Write] (UTF-8 String, max 100 bytes)
+ ├── Characteristic 19B10005 (Update status)  [Read | Notify] (UTF-8 String, max 64 bytes)
+ └── Characteristic 19B10006 (Update data)    [Write | WriteWithoutResponse] (max 512 bytes)
 ```
+
+#### Firmware Update Characteristics (`19B10004`–`19B10006`)
+Bluetooth firmware updates: `BEGIN`/`END`/`ABORT` on control, replies and cumulative ACKs on status, sequence-numbered image chunks on data. Only a paired light with an authenticated connection accepts them. A new image must be confirmed by an authenticated connection within 5 minutes of its first boot or the bootloader rolls it back. Full protocol in [docs/FIRMWARE_UPDATES.md](docs/FIRMWARE_UPDATES.md).
 
 #### Version Characteristic (`19B10003`)
 Read-only firmware version string, readable without `AUTH` (e.g. `1.2.0`; `dev` for Arduino IDE builds). Set at build time with `-DSIGNALLIGHT_VERSION="x.y.z"` (release builds pass it via `arduino-cli --build-property "compiler.cpp.extra_flags=..."`). Firmware older than this characteristic doesn't have it; the app shows the version as unknown and still connects.

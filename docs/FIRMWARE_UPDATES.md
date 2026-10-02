@@ -1,6 +1,6 @@
 # Firmware Updates over Bluetooth (Design)
 
-Status: **planned, not started.** Goal: update the light's firmware from the Windows app over Bluetooth, with no USB cable and no Wi-Fi setup.
+Status: **in progress** (see [TODO](#todo)). Goal: update the light's firmware from the Windows app over Bluetooth, with no USB cable and no Wi-Fi setup.
 
 ## Decisions
 
@@ -21,11 +21,20 @@ Checked against the installed core (`arduino:esp32` `2.0.18-arduino.5`, board `n
 
 **Device side: a small custom protocol on the existing ArduinoBLE stack, using the core's `Update` library for flash writes.** The ready-made BLE update libraries ([BLEOTA](https://github.com/gb88/BLEOTA), [NimBLEOta](https://github.com/h2zero/NimBLEOta)) use the NimBLE/Bluedroid stacks, and the sketch uses ArduinoBLE; two BLE stacks can't run at once. Their uploaders are Python/web/mobile, not Go, so the Windows side is custom either way. `Update` handles slot selection, writing, and switching the boot partition. Migrating the sketch to NimBLE stays an option if ArduinoBLE proves too slow (it's lighter and faster, but a bigger change).
 
-**Protocol sketch** (new characteristics on the existing service: one for commands, one for status notifications, one for data):
+**Protocol** (three characteristics on the existing service; device side in `handleOta` and friends in the sketch, app side in `windows/ota`):
 
-1. `BEGIN <size> <sha256>`: only accepted from an authenticated central. The device calls `Update.begin(size)` and replies `READY`.
-2. Numbered data chunks sent with `WriteWithoutResponse`. The device sends a cumulative ACK every 16 chunks, and the app keeps at most 32 chunks unacknowledged (see results below). Flow control borrows from Espressif's BLE OTA design and [esp-ota-ble](https://github.com/fl4p/esp-ota-ble).
-3. `END`: the device checks the streamed SHA-256 and `Update.end(true)`, replies `OK` or an error, then reboots into the new image.
+| UUID | Name | Properties | Content |
+|---|---|---|---|
+| `19B10004-…` | Update control | Write | `BEGIN <size> <sha256 hex>`, `END`, `ABORT` |
+| `19B10005-…` | Update status | Read, Notify | `READY`, `ACK <seq>`, `OK`, `ABORTED`, `ERR <reason>` |
+| `19B10006-…` | Update data | Write, WriteWithoutResponse (512) | `[seq uint32 LE][image bytes]` |
+
+1. `BEGIN <size> <sha256>`: only accepted from a paired light with an authenticated connection (`ERR NOT_AUTHENTICATED` otherwise). The device calls `Update.begin(size)` and replies `READY`.
+2. Numbered data chunks sent with `WriteWithoutResponse`. The device requires chunks strictly in order (`ERR SEQ expected N got M` otherwise), writes them with `Update.write`, hashes them, and sends a cumulative `ACK <seq>` every 16 chunks and after the last one. The app keeps at most 32 chunks unacknowledged (see results below). Flow control borrows from Espressif's BLE OTA design and [esp-ota-ble](https://github.com/fl4p/esp-ota-ble).
+3. `END`: the device checks the byte count and the SHA-256, then `Update.end()` (which validates the image and sets the boot partition), replies `OK`, and reboots a second later.
+4. **Confirm:** the new firmware boots in the bootloader's pending-verify state (`verifyRollbackLater()` returns `true`). The first successful `AUTH` marks it valid. If no authenticated connection arrives within 5 minutes, the light rolls back to the previous firmware and reboots.
+
+Any failure (disconnect, `ABORT`, 15 seconds without data, bad sequence, size or hash mismatch, flash error) aborts the update and leaves the current firmware untouched. The app starts over from `BEGIN`. Notifications are queued by the BLE handlers and sent from `loop()`.
 
 **Must not trust Windows write results.** WinRT can report a BLE write as successful when it never reached the device (see the `writeControl` history in `windows/ble/client.go`). Progress must be driven by the device's acknowledgements and the final hash check, never by write calls returning without error.
 
@@ -67,7 +76,7 @@ Measured with `arduino/BleThroughputTest` and `windows/cmd/blethroughput`: 128KB
 1. ~~**Prototype throughput.**~~ Done: see results above. ArduinoBLE with a 32-chunk window sends the current firmware in about 10 seconds.
 2. ~~**Firmware version reporting.**~~ Done: read-only characteristic `19B10003`, set from the `SIGNALLIGHT_VERSION` build define (`dev` for IDE builds). Release builds can set it with `arduino-cli compile --build-property "compiler.cpp.extra_flags=-DSIGNALLIGHT_VERSION=\"x.y.z\""` (verified). The Windows app discovers characteristics unfiltered so lights on older firmware still connect, and the dashboard shows the version.
 3. ~~**CI builds firmware.**~~ Done: the release workflow's `firmware` job compiles with `arduino-cli` 1.5.1, pinned to `arduino:esp32@2.0.18-arduino.5` and `ArduinoBLE@2.1.0` (the versions used for local IDE builds), stamps the version from the tag, checks the version string is in the binary, and attaches `signallight-firmware-<version>.bin` (the app image, which starts with `0xE9`) plus a `.sha256`.
-4. **Device update receiver.** Update characteristic(s), chunk/ack protocol, `Update` library calls, "updating" LED pattern, and the rollback self-check.
+4. ~~**Device update receiver.**~~ Done (protocol above). Hardware test: a 503KB image installed in 9.5s, rebooted, and was confirmed on reconnect (`dev` → `0.9.0-ota-test`). Flashing over USB from the Arduino IDE afterwards still works (back to `dev`). blue onboard LED while updating (the external light keeps its color), rollback unless confirmed by an authenticated connection within 5 minutes. Windows side: the `windows/ota` package (unit-tested against a simulated light) and a test CLI, `go run ./cmd/otaflash <SignalLight.ino.bin>` (quit SignalLight first).
 5. **Windows update client and dashboard UI.** Check GitHub for newer firmware, offer click-to-update, allow manual `.bin` upload, show progress, and retry from scratch after a disconnect.
 6. **USB recovery fallback (optional).** Flash over USB with `dfu-util` (the board's normal upload tool) if a light ever gets stuck.
 

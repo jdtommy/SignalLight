@@ -44,6 +44,10 @@
 - **Version Characteristic UUID:** `19B10003-E8F2-537E-4F6C-D104768A1214`
   - Permissions: `BLERead` (string, max 32 bytes), not gated by `AUTH`. Value comes from the `SIGNALLIGHT_VERSION` build define (`dev` by default).
   - Old firmware lacks it. The Windows client discovers characteristics **unfiltered** for this reason: the BLE library fails the whole discovery if any filtered UUID is missing.
+- **Firmware update characteristics:** `19B10004` (control, `BLEWrite`), `19B10005` (status, `BLERead | BLENotify`), `19B10006` (data, `BLEWrite | BLEWriteWithoutResponse`, 512 bytes). Protocol in `docs/FIRMWARE_UPDATES.md`; Windows sender in `windows/ota`.
+  - Only accepted on a paired, authenticated connection. Commands and replies are on **separate** characteristics because ArduinoBLE notifies subscribers of values the central writes.
+  - BLE event handlers only queue replies; `handleOta()` in `loop()` sends notifications and changes LEDs. Don't notify from inside a handler.
+  - The sketch defines `verifyRollbackLater()` to return `true`, so a new image stays pending until the first `AUTH_OK` calls `esp_ota_mark_app_valid_cancel_rollback()`. Don't remove that confirmation, or every update rolls back after 5 minutes.
 
 ### Security & Pairing Model
 - **Unpaired Mode:** Advertises as `SignalLight-[Last 4 MAC]` (e.g. `SignalLight-69F5`). Onboard/external Yellow LED pulses slowly.

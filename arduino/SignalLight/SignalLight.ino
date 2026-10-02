@@ -20,7 +20,10 @@
 
 #include <ArduinoBLE.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <esp_mac.h>
+#include "esp_ota_ops.h"
+#include "mbedtls/sha256.h"
 
 // External LED Pin definitions
 const int PIN_RED    = D2;
@@ -35,6 +38,12 @@ const char* BLE_SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214";
 const char* BLE_CHAR_UUID    = "19B10001-E8F2-537E-4F6C-D104768A1214";
 const char* BLE_AUTH_UUID    = "19B10002-E8F2-537E-4F6C-D104768A1214";
 const char* BLE_VERSION_UUID = "19B10003-E8F2-537E-4F6C-D104768A1214";
+// Firmware update (OTA) over BLE; protocol in docs/FIRMWARE_UPDATES.md.
+// Commands and replies use separate characteristics: ArduinoBLE notifies the
+// value a central writes, so a combined one would echo commands back as replies.
+const char* BLE_OTA_CONTROL_UUID = "19B10004-E8F2-537E-4F6C-D104768A1214";
+const char* BLE_OTA_STATUS_UUID  = "19B10005-E8F2-537E-4F6C-D104768A1214";
+const char* BLE_OTA_DATA_UUID    = "19B10006-E8F2-537E-4F6C-D104768A1214";
 
 // Release builds set this from the git tag (e.g. "1.2.0"); IDE builds report "dev".
 #ifndef SIGNALLIGHT_VERSION
@@ -47,6 +56,9 @@ BLEStringCharacteristic authCharacteristic(BLE_AUTH_UUID, BLERead | BLEWrite | B
 // Read-only and not gated by AUTH: the version isn't sensitive, and the app reads it
 // before deciding whether a firmware update is available.
 BLEStringCharacteristic versionCharacteristic(BLE_VERSION_UUID, BLERead, 32);
+BLEStringCharacteristic otaControlCharacteristic(BLE_OTA_CONTROL_UUID, BLEWrite, 100);
+BLEStringCharacteristic otaStatusCharacteristic(BLE_OTA_STATUS_UUID, BLERead | BLENotify, 64);
+BLECharacteristic otaDataCharacteristic(BLE_OTA_DATA_UUID, BLEWrite | BLEWriteWithoutResponse, 512);
 
 // NVS Persistent Storage
 Preferences prefs;
@@ -86,6 +98,26 @@ bool lastRawButtonDown = false;
 unsigned long lastRawButtonChange = 0;
 unsigned long buttonPressStart = 0;
 
+// Firmware update (OTA) state. BLE event handlers only change this state and call
+// Update; all BLE notifications and LED changes happen in loop(), because doing
+// them inside a handler can re-enter BLE.poll().
+const uint32_t OTA_ACK_EVERY          = 16;     // App keeps up to 32 chunks in flight (see throughput results)
+const unsigned long OTA_IDLE_TIMEOUT_MS    = 15000;  // Abort if data stops arriving
+const unsigned long OTA_CONFIRM_TIMEOUT_MS = 300000; // Roll back new firmware not confirmed within 5 min
+bool otaActive = false;
+uint32_t otaSize = 0;
+uint32_t otaReceived = 0;
+uint32_t otaExpectedSeq = 0;
+unsigned long otaLastDataAt = 0;
+uint8_t otaExpectedSha[32];
+mbedtls_sha256_context otaSha;
+bool otaAckPending = false;
+uint32_t otaAckSeq = 0;
+String otaReplyPending = "";
+unsigned long otaRebootAt = 0;   // Non-zero once a verified image is installed; reboot at this time
+bool otaDisplayShown = false;
+bool firmwarePendingVerify = false; // First boot of an OTA image, not yet confirmed good
+
 // Control the onboard RGB LED (active-LOW logic) and onboard Yellow LED (LED_BUILTIN)
 void setOnboardRGB(bool redOn, bool greenOn, bool blueOn) {
   digitalWrite(LED_RED, redOn ? LOW : HIGH);
@@ -114,8 +146,9 @@ void applyColor(char c) {
   // While the unpair button is held, the LEDs are frozen on red. Incoming commands
   // still update activeColor (via setActiveColor), so the right color is restored if
   // the hold is cancelled — they just don't reach the LEDs until then. This also keeps
-  // the watchdog from overwriting the red mid-hold.
-  if (unpairHoldActive) {
+  // the watchdog from overwriting the red mid-hold. A firmware update freezes the
+  // display the same way, from BEGIN until the reboot.
+  if (unpairHoldActive || otaActive || otaRebootAt != 0) {
     return;
   }
   if (displayedColor == c) {
@@ -232,6 +265,195 @@ void handleUnpairButton() {
     setOnboardRGB(false, false, false);
     delay(400);
     factoryReset(); // Flashes red 3 times, wipes flash, reboots unpaired
+  }
+}
+
+// The core marks a newly installed image as good before setup() runs unless this
+// returns true. Returning true makes the sketch confirm it itself (on the first
+// authenticated connection, see processAuthMessage), so a firmware that boots but
+// can't talk BLE gets rolled back. Defined weak in the core's C code, hence extern "C".
+extern "C" bool verifyRollbackLater() {
+  return true;
+}
+
+bool parseSha256Hex(const char* hex, uint8_t out[32]) {
+  if (strlen(hex) != 64) {
+    return false;
+  }
+  for (int i = 0; i < 32; i++) {
+    char byteStr[3] = {hex[2 * i], hex[2 * i + 1], 0};
+    char* end;
+    out[i] = (uint8_t)strtoul(byteStr, &end, 16);
+    if (*end != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Stops an update in progress without installing anything. Safe to call from
+// BLE handlers: no BLE calls or LED changes here (loop() restores the display).
+void otaReset() {
+  if (otaActive) {
+    Update.abort();
+    mbedtls_sha256_free(&otaSha);
+  }
+  otaActive = false;
+  otaAckPending = false;
+}
+
+void otaFail(const String& reason) {
+  Serial.println("[OTA] Failed: " + reason);
+  otaReset();
+  otaReplyPending = "ERR " + reason;
+}
+
+void otaBegin(const String& cmd) {
+  unsigned long size = 0;
+  char shaHex[65] = {0};
+  if (sscanf(cmd.c_str(), "BEGIN %lu %64s", &size, shaHex) != 2 || size == 0 || !parseSha256Hex(shaHex, otaExpectedSha)) {
+    otaReplyPending = "ERR BAD_BEGIN";
+    return;
+  }
+  otaReset();
+  if (!Update.begin(size)) {
+    otaReplyPending = String("ERR BEGIN ") + Update.errorString();
+    return;
+  }
+  mbedtls_sha256_init(&otaSha);
+  mbedtls_sha256_starts_ret(&otaSha, 0);
+  otaActive = true;
+  otaSize = size;
+  otaReceived = 0;
+  otaExpectedSeq = 0;
+  otaLastDataAt = millis();
+  Serial.printf("[OTA] Update started: %lu bytes\n", size);
+  otaReplyPending = "READY";
+}
+
+void otaEnd() {
+  if (!otaActive) {
+    otaReplyPending = "ERR NOT_ACTIVE";
+    return;
+  }
+  if (otaReceived != otaSize) {
+    otaFail("SIZE " + String(otaReceived) + "/" + String(otaSize));
+    return;
+  }
+  uint8_t digest[32];
+  mbedtls_sha256_finish_ret(&otaSha, digest);
+  if (memcmp(digest, otaExpectedSha, sizeof(digest)) != 0) {
+    otaFail("SHA_MISMATCH");
+    return;
+  }
+  mbedtls_sha256_free(&otaSha);
+  // Validates the image and makes it the boot partition for the next restart.
+  if (!Update.end()) {
+    otaActive = false; // Update already cleaned up; don't abort it again
+    otaReplyPending = String("ERR END ") + Update.errorString();
+    Serial.println("[OTA] Failed: " + otaReplyPending);
+    return;
+  }
+  otaActive = false;
+  otaRebootAt = millis() + 1000; // Give the OK notification time to go out
+  Serial.println("[OTA] Image verified and installed. Rebooting...");
+  otaReplyPending = "OK";
+}
+
+void onOtaControlWritten(BLEDevice, BLECharacteristic) {
+  String cmd = otaControlCharacteristic.value();
+  cmd.trim();
+  // Only a paired light with an authenticated app accepts firmware; otherwise any
+  // nearby BLE device could flash it.
+  if (!isPaired || !isAuthenticated) {
+    otaReplyPending = "ERR NOT_AUTHENTICATED";
+    return;
+  }
+  if (otaRebootAt != 0) {
+    otaReplyPending = "ERR REBOOTING";
+  } else if (cmd.startsWith("BEGIN ")) {
+    otaBegin(cmd);
+  } else if (cmd == "END") {
+    otaEnd();
+  } else if (cmd == "ABORT") {
+    otaReset();
+    otaReplyPending = "ABORTED";
+  } else {
+    otaReplyPending = "ERR UNKNOWN_COMMAND";
+  }
+}
+
+// Chunk format: [seq uint32 little-endian][image bytes].
+void onOtaDataWritten(BLEDevice, BLECharacteristic c) {
+  if (!otaActive) {
+    return;
+  }
+  int len = c.valueLength();
+  if (len < 5) {
+    otaFail("SHORT_CHUNK");
+    return;
+  }
+  const uint8_t* v = c.value();
+  uint32_t seq = (uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
+  if (seq != otaExpectedSeq) {
+    otaFail("SEQ expected " + String(otaExpectedSeq) + " got " + String(seq));
+    return;
+  }
+  size_t n = len - 4;
+  if (otaReceived + n > otaSize) {
+    otaFail("TOO_MUCH_DATA");
+    return;
+  }
+  if (Update.write((uint8_t*)(v + 4), n) != n) {
+    otaFail(String("WRITE ") + Update.errorString());
+    return;
+  }
+  mbedtls_sha256_update_ret(&otaSha, v + 4, n);
+  otaReceived += n;
+  otaExpectedSeq++;
+  otaLastDataAt = millis();
+  if (otaExpectedSeq % OTA_ACK_EVERY == 0 || otaReceived == otaSize) {
+    otaAckSeq = seq;
+    otaAckPending = true;
+  }
+}
+
+// Called every loop(): sends queued replies, enforces the idle timeout, shows the
+// update on the LEDs, reboots after a successful update, and rolls back new
+// firmware that was never confirmed.
+void handleOta() {
+  if (otaAckPending) {
+    otaAckPending = false;
+    otaStatusCharacteristic.writeValue("ACK " + String(otaAckSeq));
+  }
+  if (otaReplyPending.length() > 0) {
+    Serial.println("[OTA] -> " + otaReplyPending);
+    otaStatusCharacteristic.writeValue(otaReplyPending);
+    otaReplyPending = "";
+  }
+  if (otaActive && millis() - otaLastDataAt > OTA_IDLE_TIMEOUT_MS) {
+    otaFail("TIMEOUT");
+  }
+
+  bool showOta = otaActive || otaRebootAt != 0;
+  if (showOta && !otaDisplayShown) {
+    otaDisplayShown = true;
+    setOnboardRGB(false, false, true); // Onboard blue; external light keeps its color
+  } else if (!showOta && otaDisplayShown) {
+    otaDisplayShown = false;
+    displayedColor = ' '; // Force applyColor to re-drive the LEDs
+    applyColor(isPaired ? activeColor : 'Y');
+  }
+
+  if (otaRebootAt != 0 && (long)(millis() - otaRebootAt) >= 0) {
+    BLE.end();
+    delay(100);
+    ESP.restart();
+  }
+
+  if (firmwarePendingVerify && millis() > OTA_CONFIRM_TIMEOUT_MS) {
+    Serial.println("[OTA] New firmware was never confirmed by an authenticated connection. Rolling back...");
+    esp_ota_mark_app_invalid_rollback_and_reboot();
   }
 }
 
@@ -360,6 +582,13 @@ void processAuthMessage(String msg) {
       isAuthenticated = true;
       authCharacteristic.writeValue("AUTH_OK");
       Serial.println("[Auth] Authentication SUCCESS.");
+      // An authenticated connection proves new firmware can still talk BLE and
+      // pair, which is what's needed to update it again: keep it.
+      if (firmwarePendingVerify) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        firmwarePendingVerify = false;
+        Serial.println("[OTA] New firmware confirmed good; rollback cancelled.");
+      }
       applyColor(activeColor);
     } else {
       authCharacteristic.writeValue("AUTH_FAIL");
@@ -420,6 +649,10 @@ void blePeripheralDisconnectHandler(BLEDevice central) {
   isAuthenticated = false;
   needAdvertise = true;
   disconnectTime = millis();
+  if (otaActive) {
+    Serial.println("[OTA] Central disconnected mid-update. Aborting; current firmware unchanged.");
+    otaReset();
+  }
 }
 
 void setup() {
@@ -438,6 +671,15 @@ void setup() {
   delay(300);
   Serial.println("\n=========================================");
   Serial.println("SignalLight Controller (Nano ESP32)");
+
+  // First boot of a firmware installed over BLE: it must be confirmed (see
+  // verifyRollbackLater) or it's rolled back.
+  esp_ota_img_states_t otaState;
+  if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &otaState) == ESP_OK &&
+      otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+    firmwarePendingVerify = true;
+    Serial.println("[OTA] Running newly installed firmware; waiting for an authenticated connection to confirm it (rolls back after 5 min otherwise).");
+  }
 
   // 1. Read Factory Hardware MAC Address directly from eFuse
   uint8_t baseMac[6];
@@ -485,6 +727,11 @@ void setup() {
     lightService.addCharacteristic(lightCharacteristic);
     lightService.addCharacteristic(authCharacteristic);
     lightService.addCharacteristic(versionCharacteristic);
+    lightService.addCharacteristic(otaControlCharacteristic);
+    lightService.addCharacteristic(otaStatusCharacteristic);
+    lightService.addCharacteristic(otaDataCharacteristic);
+    otaControlCharacteristic.setEventHandler(BLEWritten, onOtaControlWritten);
+    otaDataCharacteristic.setEventHandler(BLEWritten, onOtaDataWritten);
     BLE.addService(lightService);
 
     lightCharacteristic.writeValue((byte)displayedColor);
@@ -507,6 +754,7 @@ void loop() {
 
   // 1. Unpair button (hold 10s to factory reset)
   handleUnpairButton();
+  handleOta();
 
   // 2. Poll BLE stack
   BLE.poll();

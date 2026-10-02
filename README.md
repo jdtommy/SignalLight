@@ -191,7 +191,7 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 - [x] Prototype BLE transfer throughput on ArduinoBLE: ~47 KB/s with flash writes, so the ~469KB firmware takes ~10s; no NimBLE migration needed
 - [x] Firmware reports its version (read-only characteristic `19B10003`); dashboard shows it
 - [x] Release workflow compiles the firmware with `arduino-cli` and attaches `signallight-firmware-<version>.bin` + `.sha256`
-- [ ] Firmware update receiver: chunk/ack protocol, `Update` library, "updating" LED pattern, rollback self-check
+- [x] Firmware update receiver: chunk/ack protocol, `Update` library, "updating" LED pattern, rollback self-check (a ~500KB update takes ~10s)
 - [ ] Windows update client + dashboard UI: GitHub check, manual `.bin` upload, progress, retry
 - [ ] (Optional) USB recovery flashing via `dfu-util`
 
