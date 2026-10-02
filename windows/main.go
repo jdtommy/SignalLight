@@ -5,14 +5,18 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"signallight/applog"
 	"signallight/ble"
 	"signallight/config"
 	"signallight/hotkey"
+	"signallight/instance"
 	"signallight/serial"
 	"signallight/server"
 	"signallight/session"
@@ -35,12 +39,29 @@ func main() {
 	checkInterval := flag.Duration("interval", 1*time.Second, "Zoom polling interval")
 	flag.Parse()
 
+	// Log to %LOCALAPPDATA%\SignalLight\signallight.log (plus the console, if any).
+	if dir, err := os.UserCacheDir(); err == nil {
+		if f, err := applog.Init(filepath.Join(dir, "SignalLight"), 5<<20); err == nil {
+			defer f.Close()
+		}
+	}
+
 	// Load stored configuration from %APPDATA%\SignalLight\config.json.
 	// Load() always returns a non-nil config (an empty/unpaired default on error),
 	// so a corrupt or unreadable file degrades to "unpaired" instead of crashing.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Printf("[Config] Warning: error reading config, starting unpaired: %v", err)
+	}
+
+	if ok, err := instance.Acquire(instance.MutexName); err != nil {
+		log.Printf("[Startup] Warning: single-instance check failed, continuing: %v", err)
+	} else if !ok {
+		log.Println("[Startup] SignalLight is already running; opening its dashboard instead.")
+		if cfg.WebPort > 0 {
+			_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", fmt.Sprintf("http://localhost:%d", cfg.WebPort)).Start()
+		}
+		return
 	}
 
 	// Command-line flag overrides
@@ -62,22 +83,24 @@ func main() {
 
 	displayHost := fmt.Sprintf("localhost:%d", portNum)
 
-	fmt.Println("==================================================")
-	fmt.Println("        SignalLight Controller for Windows        ")
-	fmt.Println("==================================================")
+	// Banner goes through the logger's writer so it also lands in the log file.
+	out := log.Writer()
+	fmt.Fprintln(out, "==================================================")
+	fmt.Fprintln(out, "        SignalLight Controller for Windows        ")
+	fmt.Fprintln(out, "==================================================")
 	if cfg.Paired && cfg.TargetMAC != "" {
-		fmt.Printf("Paired Device: %s (%s)\n", cfg.DeviceName, cfg.TargetMAC)
+		fmt.Fprintf(out, "Paired Device: %s (%s)\n", cfg.DeviceName, cfg.TargetMAC)
 	} else {
-		fmt.Println("Paired Device: None (Open Web Dashboard to pair)")
+		fmt.Fprintln(out, "Paired Device: None (Open Web Dashboard to pair)")
 	}
-	fmt.Println("Config File:   " + config.GetConfigPath())
-	fmt.Println("Hotkeys:")
-	fmt.Println("  [Ctrl + Shift + G] -> Set GREEN  (Available / Free)")
-	fmt.Println("  [Ctrl + Shift + Y] -> Set YELLOW (Away / Not at Desk)")
-	fmt.Println("  [Ctrl + Shift + R] -> Set RED    (In Meeting / Busy)")
-	fmt.Println("  [Ctrl + Shift + A] -> Set AUTO   (Sync with Zoom)")
-	fmt.Println("Web Dashboard: http://" + displayHost)
-	fmt.Println("==================================================")
+	fmt.Fprintln(out, "Config File:   "+config.GetConfigPath())
+	fmt.Fprintln(out, "Hotkeys:")
+	fmt.Fprintln(out, "  [Ctrl + Shift + G] -> Set GREEN  (Available / Free)")
+	fmt.Fprintln(out, "  [Ctrl + Shift + Y] -> Set YELLOW (Away / Not at Desk)")
+	fmt.Fprintln(out, "  [Ctrl + Shift + R] -> Set RED    (In Meeting / Busy)")
+	fmt.Fprintln(out, "  [Ctrl + Shift + A] -> Set AUTO   (Sync with Zoom)")
+	fmt.Fprintln(out, "Web Dashboard: http://"+displayHost)
+	fmt.Fprintln(out, "==================================================")
 
 	stateMgr := state.NewManager()
 

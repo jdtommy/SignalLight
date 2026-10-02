@@ -88,6 +88,8 @@ SignalLight/
 │   ├── go.mod / go.sum
 │   ├── main.go                  # Windows application entry point
 │   └── signallight.exe          # Compiled standalone Windows executable
+├── installer/
+│   └── SignalLight.iss          # Inno Setup script for the per-user installer
 ├── jdtommy-status-indicator.edif              # Driver PCB netlist (previous revision, no CN3)
 ├── status-indicator-dxf/                      # Driver PCB plot previews (DXF, not needed for ordering)
 ├── status-indicator-svg/                      # Driver PCB plot previews (SVG, not needed for ordering)
@@ -147,7 +149,12 @@ The Windows app is written in **Go (Golang)**. It features:
 
 ### Running the App
 
-#### Method 1: Running from Source (Recommended)
+#### Method 1: Installer (Recommended)
+Download `SignalLight-Setup-<version>.exe` from the [latest GitHub Release](https://github.com/jdtommy/SignalLight/releases/latest) and run it. It's signed, needs no admin rights, and installs just for you to `%LOCALAPPDATA%\Programs\SignalLight`. It adds a Start menu shortcut and, unless you untick it, starts SignalLight when you sign in. Uninstall from **Settings → Apps → Installed apps**; it asks whether to keep your pairing.
+
+The installed app has no console window: it lives in the system tray, and its log is at `%LOCALAPPDATA%\SignalLight\signallight.log`. Only one copy runs at a time; launching it again opens the dashboard.
+
+#### Method 2: Running from Source (Development)
 This bypasses Windows 11 Smart App Control policies without requiring code-signing certificates:
 ```powershell
 cd C:\Users\jdtom\dev\SignalLight\windows
@@ -155,8 +162,8 @@ go run .
 ```
 Or simply double-click [`windows/run.bat`](file:///C:/Users/jdtom/dev/SignalLight/windows/run.bat) or run [`windows/run.ps1`](file:///C:/Users/jdtom/dev/SignalLight/windows/run.ps1).
 
-#### Method 2: Using the Pre-compiled Binary
-Download the signed `signallight.exe` from the [latest GitHub Release](https://github.com/jdtommy/SignalLight/releases/latest), or build your own from source:
+#### Method 3: Standalone Binary
+Download the signed `signallight.exe` from the [latest GitHub Release](https://github.com/jdtommy/SignalLight/releases/latest) and run it from any folder (no install, no startup entry), or build your own from source:
 ```powershell
 cd C:\Users\jdtom\dev\SignalLight\windows
 .\signallight.exe
@@ -178,7 +185,7 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 ## 📋 Future Roadmap & TODO
 - [x] **Binary Code Signing**: `signallight.exe` attached to GitHub Releases is signed via [Azure Trusted Signing](https://azure.microsoft.com/en-us/products/artifact-signing) (Public Trust, individual developer), so it should run under Smart App Control without a warning.
 - [x] **Automated release signing**: pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which tests, builds, signs, and verifies `signallight.exe`, then attaches it to a **draft** release. Review the notes and publish. Azure sign-in uses GitHub OIDC, so no Azure secret is stored in GitHub.
-- [ ] **MSIX Packaging**: consider MSIX packaging as an alternative/complementary distribution method.
+- [x] **Installer**: signed per-user Inno Setup installer ([`installer/SignalLight.iss`](installer/SignalLight.iss)), built by the release workflow.
 
 ---
 

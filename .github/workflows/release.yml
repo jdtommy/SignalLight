@@ -1,8 +1,9 @@
 name: Build and sign release
 
-# Push a v* tag to build, sign, and attach signallight.exe to a DRAFT release
-# (review the notes, then publish). "Run workflow" builds and signs without
-# releasing, and uploads the signed exe as a workflow artifact for testing.
+# Push a v* tag to build and sign signallight.exe plus the per-user installer
+# (SignalLight-Setup-<version>.exe) and attach both to a DRAFT release (review the
+# notes, then publish). "Run workflow" builds and signs without releasing, and
+# uploads both as a workflow artifact for testing.
 on:
   push:
     tags: ['v*']
@@ -33,9 +34,11 @@ jobs:
         working-directory: windows
         run: go test ./...
 
+      # windowsgui: no console window when it starts at sign-in; logs go to
+      # %LOCALAPPDATA%\SignalLight\signallight.log instead.
       - name: Build
         working-directory: windows
-        run: go build -o signallight.exe .
+        run: go build -ldflags "-H=windowsgui" -o signallight.exe .
 
       - name: Azure sign-in
         uses: azure/login@v3
@@ -66,12 +69,33 @@ jobs:
           if (-not $sig.TimeStamperCertificate) { throw "Signature is not timestamped" }
           "Signed by: $($sig.SignerCertificate.Subject)"
 
-      - name: Upload signed exe (manual runs)
+      # Inno Setup signs both Setup and the uninstaller it installs, using the same
+      # sign tool. In the /S value, $q is a quote and $f is the file being signed.
+      - name: Build signed installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          $version = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME.Substring(1) } else { "0.0.0-dev.$env:GITHUB_RUN_NUMBER" }
+          $sign = '$q' + "$PWD\.tools\sign.exe" + '$q code artifact-signing $f --artifact-signing-endpoint https://eus.codesigning.azure.net/ --artifact-signing-account jdtommy --artifact-signing-certificate-profile SignalLight --azure-credential-type azure-cli --publisher-name $qJarad Duersch$q --description SignalLight --description-url https://github.com/jdtommy/SignalLight --verbosity warning'
+          & $iscc "/DAppVersion=$version" /DSIGN "/Sazsign=$sign" installer/SignalLight.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+
+      - name: Verify installer signature
+        run: |
+          $setup = Get-ChildItem installer/Output/SignalLight-Setup-*.exe
+          $sig = Get-AuthenticodeSignature $setup.FullName
+          if ($sig.Status -ne 'Valid') { throw "Installer signature check failed: $($sig.Status) - $($sig.StatusMessage)" }
+          if (-not $sig.TimeStamperCertificate) { throw "Installer signature is not timestamped" }
+          "$($setup.Name) signed by: $($sig.SignerCertificate.Subject)"
+
+      - name: Upload signed files (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
           name: signallight-signed
-          path: windows/signallight.exe
+          path: |
+            windows/signallight.exe
+            installer/Output/SignalLight-Setup-*.exe
 
       - name: Attach to draft release (tag pushes)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -79,9 +103,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
+          $files = @('windows/signallight.exe') + (Get-ChildItem installer/Output/SignalLight-Setup-*.exe).FullName
           gh release view $tag 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag windows/signallight.exe --clobber
+            gh release upload $tag @files --clobber
           } else {
-            gh release create $tag windows/signallight.exe --draft --generate-notes --title "SignalLight $tag"
+            gh release create $tag @files --draft --generate-notes --title "SignalLight $tag"
           }
