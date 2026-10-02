@@ -34,10 +34,19 @@ const int PIN_UNPAIR_BUTTON = D5; // Momentary button to GND; INPUT_PULLUP, so p
 const char* BLE_SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214";
 const char* BLE_CHAR_UUID    = "19B10001-E8F2-537E-4F6C-D104768A1214";
 const char* BLE_AUTH_UUID    = "19B10002-E8F2-537E-4F6C-D104768A1214";
+const char* BLE_VERSION_UUID = "19B10003-E8F2-537E-4F6C-D104768A1214";
+
+// Release builds set this from the git tag (e.g. "1.2.0"); IDE builds report "dev".
+#ifndef SIGNALLIGHT_VERSION
+#define SIGNALLIGHT_VERSION "dev"
+#endif
 
 BLEService lightService(BLE_SERVICE_UUID);
 BLEByteCharacteristic lightCharacteristic(BLE_CHAR_UUID, BLERead | BLEWrite | BLEWriteWithoutResponse | BLENotify);
 BLEStringCharacteristic authCharacteristic(BLE_AUTH_UUID, BLERead | BLEWrite | BLENotify, 64);
+// Read-only and not gated by AUTH: the version isn't sensitive, and the app reads it
+// before deciding whether a firmware update is available.
+BLEStringCharacteristic versionCharacteristic(BLE_VERSION_UUID, BLERead, 32);
 
 // NVS Persistent Storage
 Preferences prefs;
@@ -458,6 +467,8 @@ void setup() {
     advertisedName = deviceName;
   }
 
+  Serial.print("[Config] Firmware Version: ");
+  Serial.println(SIGNALLIGHT_VERSION);
   Serial.print("[Config] Status: ");
   Serial.println(isPaired ? "PAIRED" : "UNPAIRED");
   Serial.print("[Config] Advertising Name: ");
@@ -473,10 +484,12 @@ void setup() {
 
     lightService.addCharacteristic(lightCharacteristic);
     lightService.addCharacteristic(authCharacteristic);
+    lightService.addCharacteristic(versionCharacteristic);
     BLE.addService(lightService);
 
     lightCharacteristic.writeValue((byte)displayedColor);
     authCharacteristic.writeValue(isPaired ? "STATUS:PAIRED" : "STATUS:UNPAIRED");
+    versionCharacteristic.writeValue(SIGNALLIGHT_VERSION);
 
     BLE.setEventHandler(BLEConnected, blePeripheralConnectHandler);
     BLE.setEventHandler(BLEDisconnected, blePeripheralDisconnectHandler);

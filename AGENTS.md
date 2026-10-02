@@ -41,6 +41,9 @@
   - Permissions: `BLERead | BLEWrite | BLEWriteWithoutResponse | BLENotify` (1 byte)
 - **Auth Characteristic UUID:** `19B10002-E8F2-537E-4F6C-D104768A1214`
   - Permissions: `BLERead | BLEWrite | BLENotify` (string, max 64 bytes)
+- **Version Characteristic UUID:** `19B10003-E8F2-537E-4F6C-D104768A1214`
+  - Permissions: `BLERead` (string, max 32 bytes), not gated by `AUTH`. Value comes from the `SIGNALLIGHT_VERSION` build define (`dev` by default).
+  - Old firmware lacks it. The Windows client discovers characteristics **unfiltered** for this reason: the BLE library fails the whole discovery if any filtered UUID is missing.
 
 ### Security & Pairing Model
 - **Unpaired Mode:** Advertises as `SignalLight-[Last 4 MAC]` (e.g. `SignalLight-69F5`). Onboard/external Yellow LED pulses slowly.

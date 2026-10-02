@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,6 +38,24 @@ func newTestServer(zoomSecret string) *Server {
 	stateMgr := state.NewManager()
 	stateMgr.SetConnected(true)
 	return NewServer(":0", stateMgr, nil, zoomSecret)
+}
+
+func TestHandleStatusIncludesFirmwareVersion(t *testing.T) {
+	s := newTestServer("")
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+
+	var got map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON %q: %v", w.Body.String(), err)
+	}
+	// Existing fields must stay at the top level for the dashboard.
+	for _, key := range []string{"color", "mode", "connected", "firmware_version"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("status JSON missing %q: %s", key, w.Body.String())
+		}
+	}
 }
 
 func TestHandleSetRejectsGET(t *testing.T) {

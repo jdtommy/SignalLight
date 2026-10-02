@@ -189,7 +189,7 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 
 **Firmware updates over Bluetooth** (click-to-update from the dashboard; design and rationale in [docs/FIRMWARE_UPDATES.md](docs/FIRMWARE_UPDATES.md)):
 - [x] Prototype BLE transfer throughput on ArduinoBLE: ~47 KB/s with flash writes, so the ~469KB firmware takes ~10s; no NimBLE migration needed
-- [ ] Firmware reports its version; dashboard shows it
+- [x] Firmware reports its version (read-only characteristic `19B10003`); dashboard shows it
 - [ ] Release workflow compiles the firmware with `arduino-cli` and attaches the `.bin` + SHA-256
 - [ ] Firmware update receiver: chunk/ack protocol, `Update` library, "updating" LED pattern, rollback self-check
 - [ ] Windows update client + dashboard UI: GitHub check, manual `.bin` upload, progress, retry

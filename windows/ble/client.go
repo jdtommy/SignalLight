@@ -15,9 +15,10 @@ import (
 )
 
 var (
-	ServiceUUID, _            = bluetooth.ParseUUID("19B10000-E8F2-537E-4F6C-D104768A1214")
-	CharacteristicUUID, _     = bluetooth.ParseUUID("19B10001-E8F2-537E-4F6C-D104768A1214")
-	AuthCharacteristicUUID, _ = bluetooth.ParseUUID("19B10002-E8F2-537E-4F6C-D104768A1214")
+	ServiceUUID, _               = bluetooth.ParseUUID("19B10000-E8F2-537E-4F6C-D104768A1214")
+	CharacteristicUUID, _        = bluetooth.ParseUUID("19B10001-E8F2-537E-4F6C-D104768A1214")
+	AuthCharacteristicUUID, _    = bluetooth.ParseUUID("19B10002-E8F2-537E-4F6C-D104768A1214")
+	VersionCharacteristicUUID, _ = bluetooth.ParseUUID("19B10003-E8F2-537E-4F6C-D104768A1214")
 )
 
 type DiscoveredDevice struct {
@@ -32,6 +33,8 @@ type Client struct {
 	device        *bluetooth.Device
 	char          *bluetooth.DeviceCharacteristic
 	authChar      *bluetooth.DeviceCharacteristic
+	versionChar   *bluetooth.DeviceCharacteristic
+	fwVersion     string // Firmware version of the connected light; "" if unknown
 	mu            sync.Mutex
 	scanMu        sync.Mutex
 	connected     bool
@@ -166,6 +169,14 @@ func (c *Client) SendColor(colorStr string) {
 	}
 }
 
+// FirmwareVersion returns the connected light's firmware version, or "" if no light
+// is connected or its firmware predates version reporting.
+func (c *Client) FirmwareVersion() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fwVersion
+}
+
 func (c *Client) IsConnected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -289,6 +300,9 @@ func (c *Client) PairDevice(macAddress string, friendlyName string, secret strin
 	if macAddress == "" || friendlyName == "" || secret == "" {
 		return errors.New("mac address, name, and secret must not be empty")
 	}
+	if err := validatePairCommand(friendlyName, secret); err != nil {
+		return err
+	}
 
 	// Tell background loop to pause while pairing
 	c.mu.Lock()
@@ -343,8 +357,8 @@ func (c *Client) PairDevice(macAddress string, friendlyName string, secret strin
 	}
 
 	// Discover service and characteristics
-	lightChar, authChar, err := c.discoverCharacteristics(&device)
-	if err != nil || authChar == nil {
+	lightChar, authChar, versionChar, err := c.discoverCharacteristics(&device)
+	if err != nil {
 		_ = device.Disconnect()
 		return fmt.Errorf("failed to discover characteristics: %w", err)
 	}
@@ -356,7 +370,12 @@ func (c *Client) PairDevice(macAddress string, friendlyName string, secret strin
 		return fmt.Errorf("failed to write pairing packet: %w", err)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	if err := awaitPairResponse(authChar); err != nil {
+		log.Printf("[BLE] Pairing with %s failed: %v", macAddress, err)
+		_ = device.Disconnect()
+		return err
+	}
+	log.Printf("[BLE] Light confirmed pairing (PAIR_OK).")
 
 	devCopy := device
 	// Hand over connection to active session - maintain the connection without dropping!
@@ -367,6 +386,7 @@ func (c *Client) PairDevice(macAddress string, friendlyName string, secret strin
 	c.device = &devCopy
 	c.char = lightChar
 	c.authChar = authChar
+	c.versionChar = versionChar
 	c.connected = true
 	c.authenticated = true
 	c.mu.Unlock()
@@ -418,6 +438,8 @@ func (c *Client) UnpairCurrent() (err error) {
 	c.device = nil
 	c.char = nil
 	c.authChar = nil
+	c.versionChar = nil
+	c.fwVersion = ""
 	c.mu.Unlock()
 
 	return nil
@@ -506,7 +528,7 @@ func (c *Client) lifecycleLoop() {
 		}
 
 		log.Printf("[BLE] Connected! Discovering services...")
-		lightChar, authChar, err := c.discoverCharacteristics(&device)
+		lightChar, authChar, versionChar, err := c.discoverCharacteristics(&device)
 		if err != nil {
 			log.Printf("[BLE] Failed to discover characteristics: %v. Disconnecting...", err)
 			_ = device.Disconnect()
@@ -594,6 +616,7 @@ func (c *Client) lifecycleLoop() {
 		c.device = &device
 		c.char = lightChar
 		c.authChar = authChar
+		c.versionChar = versionChar
 		c.connected = true
 		c.authenticated = authenticated
 		c.mu.Unlock()
@@ -629,6 +652,19 @@ func (c *Client) runSession(device *bluetooth.Device, lightChar *bluetooth.Devic
 
 	defer c.abortActiveSession()
 
+	c.mu.Lock()
+	versionChar := c.versionChar
+	c.mu.Unlock()
+	fw := readFirmwareVersion(versionChar)
+	c.mu.Lock()
+	c.fwVersion = fw
+	c.mu.Unlock()
+	if fw != "" {
+		log.Printf("[BLE] Light firmware version: %s", fw)
+	} else {
+		log.Printf("[BLE] Light firmware version unknown (firmware predates version reporting)")
+	}
+
 	log.Printf("[BLE] Service & Characteristics ready!")
 	if c.onConnect != nil {
 		c.onConnect()
@@ -657,6 +693,8 @@ func (c *Client) runSession(device *bluetooth.Device, lightChar *bluetooth.Devic
 	c.device = nil
 	c.char = nil
 	c.authChar = nil
+	c.versionChar = nil
+	c.fwVersion = ""
 	c.mu.Unlock()
 
 	log.Printf("[BLE] Disconnected from device.")
@@ -723,7 +761,9 @@ func (c *Client) scanForTarget(targetMAC, targetName string) (*bluetooth.ScanRes
 	return foundResult, nil
 }
 
-func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar *bluetooth.DeviceCharacteristic, authChar *bluetooth.DeviceCharacteristic, err error) {
+// discoverCharacteristics finds the control and auth characteristics (both required)
+// and the firmware version characteristic (nil on firmware that predates it).
+func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar, authChar, versionChar *bluetooth.DeviceCharacteristic, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[BLE] Recovered from WinRT service discovery panic: %v", r)
@@ -732,7 +772,7 @@ func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar *b
 	}()
 
 	if device == nil {
-		return nil, nil, errors.New("device is nil")
+		return nil, nil, nil, errors.New("device is nil")
 	}
 
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -744,25 +784,120 @@ func (c *Client) discoverCharacteristics(device *bluetooth.Device) (lightChar *b
 			continue
 		}
 
-		chars, cErr := services[0].DiscoverCharacteristics([]bluetooth.UUID{CharacteristicUUID, AuthCharacteristicUUID})
-		if cErr != nil || len(chars) == 0 {
-			err = fmt.Errorf("characteristics not found (attempt %d/3): %v", attempt, cErr)
+		// No filter: the library fails the whole call if any filtered UUID is
+		// missing, which would block connecting to firmware without a version
+		// characteristic (and so block updating it).
+		chars, cErr := services[0].DiscoverCharacteristics(nil)
+		if cErr != nil {
+			err = fmt.Errorf("characteristic discovery failed (attempt %d/3): %v", attempt, cErr)
 			continue
 		}
 
+		lightChar, authChar, versionChar = nil, nil, nil
 		for i := range chars {
-			if chars[i].UUID() == CharacteristicUUID {
+			switch chars[i].UUID() {
+			case CharacteristicUUID:
 				lightChar = &chars[i]
-			} else if chars[i].UUID() == AuthCharacteristicUUID {
+			case AuthCharacteristicUUID:
 				authChar = &chars[i]
+			case VersionCharacteristicUUID:
+				versionChar = &chars[i]
 			}
 		}
 
-		if lightChar != nil {
-			return lightChar, authChar, nil
+		if lightChar != nil && authChar != nil {
+			return lightChar, authChar, versionChar, nil
+		}
+		err = fmt.Errorf("control/auth characteristics not found (attempt %d/3)", attempt)
+	}
+	return nil, nil, nil, err
+}
+
+// maxAuthMessage is the auth characteristic's size on the light
+// (BLEStringCharacteristic ..., 64). Longer writes are silently truncated.
+const maxAuthMessage = 64
+
+// validatePairCommand rejects names the light would mis-store. A PAIR command
+// longer than the auth characteristic gets truncated, cutting off part of the
+// secret: the light would keep a different secret than the app saves, and every
+// reconnect would fail authentication. A ':' in the name breaks the light's
+// "PAIR:<name>:<secret>" parsing the same way.
+func validatePairCommand(name, secret string) error {
+	if strings.Contains(name, ":") {
+		return errors.New("device name can't contain ':'")
+	}
+	if maxName := maxAuthMessage - len("PAIR::") - len(secret); len(name) > maxName {
+		return fmt.Errorf("device name is too long (max %d characters)", maxName)
+	}
+	return nil
+}
+
+// awaitPairResponse waits for the light's answer to a PAIR command and accepts
+// only PAIR_OK. The auth characteristic first reads back our own PAIR command
+// (ArduinoBLE stores what the central wrote) until the sketch processes it, so
+// keep polling until the value changes to a reply.
+func awaitPairResponse(authChar *bluetooth.DeviceCharacteristic) error {
+	buf := make([]byte, maxAuthMessage)
+	var lastErr error
+	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(200 * time.Millisecond)
+		n, err := authChar.Read(buf)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := pairResult(strings.TrimSpace(string(buf[:n]))); err != errPairPending {
+			return err
 		}
 	}
-	return nil, nil, err
+	if lastErr != nil {
+		return fmt.Errorf("light did not confirm pairing: %w", lastErr)
+	}
+	return errors.New("light did not confirm pairing")
+}
+
+var errPairPending = errors.New("no reply yet")
+
+// pairResult interprets the auth characteristic's value after a PAIR command.
+func pairResult(resp string) error {
+	switch {
+	case resp == "PAIR_OK":
+		return nil
+	case resp == "ERR:ALREADY_PAIRED":
+		return errors.New("this light is already paired. Hold its button for 10 seconds to unpair it, then try again")
+	case strings.HasPrefix(resp, "ERR:"):
+		return fmt.Errorf("light rejected pairing (%s)", resp)
+	default:
+		return errPairPending // Still our echoed command, or the earlier STATUS value
+	}
+}
+
+// readFirmwareVersion returns the version the light reports, or "" for firmware
+// that predates the version characteristic or a failed read.
+func readFirmwareVersion(versionChar *bluetooth.DeviceCharacteristic) string {
+	if versionChar == nil {
+		return ""
+	}
+	buf := make([]byte, 32)
+	n, err := versionChar.Read(buf)
+	if err != nil {
+		log.Printf("[BLE] Could not read firmware version: %v", err)
+		return ""
+	}
+	return sanitizeVersion(string(buf[:n]))
+}
+
+// sanitizeVersion keeps only characters that can appear in a version string, so
+// a corrupted read (this link has been seen to garble data) can't put arbitrary
+// text into the dashboard or logs.
+func sanitizeVersion(s string) string {
+	s = strings.TrimSpace(s)
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '.' || r == '-' || r == '+') {
+			return ""
+		}
+	}
+	return s
 }
 
 // confirmUnpaired re-queries the device's pairing status directly ("STATUS?") as a

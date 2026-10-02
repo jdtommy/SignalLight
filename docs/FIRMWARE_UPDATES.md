@@ -65,7 +65,7 @@ Measured with `arduino/BleThroughputTest` and `windows/cmd/blethroughput`: 128KB
 ## TODO
 
 1. ~~**Prototype throughput.**~~ Done: see results above. ArduinoBLE with a 32-chunk window sends the current firmware in about 10 seconds.
-2. **Firmware version reporting.** The light reports its version (e.g. in the `STATUS?` reply), and the dashboard displays it.
+2. ~~**Firmware version reporting.**~~ Done: read-only characteristic `19B10003`, set from the `SIGNALLIGHT_VERSION` build define (`dev` for IDE builds). Release builds can set it with `arduino-cli compile --build-property "compiler.cpp.extra_flags=-DSIGNALLIGHT_VERSION=\"x.y.z\""` (verified). The Windows app discovers characteristics unfiltered so lights on older firmware still connect, and the dashboard shows the version.
 3. **CI builds firmware.** `arduino-cli compile` on each `v*` tag; attach the `.bin` and SHA-256 to the draft release.
 4. **Device update receiver.** Update characteristic(s), chunk/ack protocol, `Update` library calls, "updating" LED pattern, and the rollback self-check.
 5. **Windows update client and dashboard UI.** Check GitHub for newer firmware, offer click-to-update, allow manual `.bin` upload, show progress, and retry from scratch after a disconnect.

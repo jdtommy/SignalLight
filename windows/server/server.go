@@ -140,8 +140,14 @@ func (s *Server) Start(listeners ...net.Listener) error {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	status := s.stateMgr.GetStatus()
-	_ = json.NewEncoder(w).Encode(status)
+	fw := ""
+	if s.bleClient != nil {
+		fw = s.bleClient.FirmwareVersion()
+	}
+	_ = json.NewEncoder(w).Encode(struct {
+		state.Status
+		FirmwareVersion string `json:"firmware_version"`
+	}{s.stateMgr.GetStatus(), fw})
 }
 
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
@@ -705,6 +711,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="device-detail">Device Name: <strong id="cfg-name">-</strong></div>
                 <div class="device-detail">MAC Address: <strong id="cfg-mac">-</strong></div>
                 <div class="device-detail">Security: <strong id="cfg-sec">Shared Secret Handshake</strong></div>
+                <div class="device-detail">Firmware: <strong id="cfg-fw">-</strong></div>
                 <div class="device-actions">
                     <button class="btn-unpair" onclick="unpairLight()">Unpair / Reset Light</button>
                 </div>
@@ -735,7 +742,7 @@ const dashboardHTML = `<!DOCTYPE html>
             </div>
             <div class="form-group">
                 <label>Custom Device Name</label>
-                <input type="text" id="modal-name" placeholder="e.g. Office Desk">
+                <input type="text" id="modal-name" placeholder="e.g. Office Desk" maxlength="26">
             </div>
             <p style="font-size: 0.75rem; color: var(--text-dim); margin: -8px 0 12px;">
                 A security secret will be generated automatically for this device — nothing to remember or type.
@@ -788,6 +795,8 @@ const dashboardHTML = `<!DOCTYPE html>
             document.getElementById('info-mode').innerText = data.mode;
             document.getElementById('info-zoom').innerText = data.zoom_meeting ? 'IN MEETING' : 'NO MEETING';
             document.getElementById('info-lock').innerText = data.session_locked ? 'LOCKED' : 'UNLOCKED';
+            document.getElementById('cfg-fw').textContent = !data.connected ? '- (light not connected)'
+                : (data.firmware_version || 'unknown (older firmware)');
 
             if (!data.connected) {
                 badge.className = 'status-badge OFF';
