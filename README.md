@@ -177,7 +177,7 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 
 ## 📋 Future Roadmap & TODO
 - [x] **Binary Code Signing**: `signallight.exe` attached to GitHub Releases is signed via [Azure Trusted Signing](https://azure.microsoft.com/en-us/products/artifact-signing) (Public Trust, individual developer), so it should run under Smart App Control without a warning.
-- [ ] **Automate release signing**: signing is currently a manual step (`sign code artifact-signing`, requires the maintainer's own `az login` session) run before uploading a release asset — move this into a CI/release pipeline so it isn't a manual, single-person-dependent step.
+- [x] **Automated release signing**: pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which tests, builds, signs, and verifies `signallight.exe`, then attaches it to a **draft** release. Review the notes and publish. Azure sign-in uses GitHub OIDC, so no Azure secret is stored in GitHub.
 - [ ] **MSIX Packaging**: consider MSIX packaging as an alternative/complementary distribution method.
 
 ---
