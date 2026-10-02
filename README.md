@@ -188,7 +188,7 @@ cd C:\Users\jdtom\dev\SignalLight\windows
 - [x] **Installer**: signed per-user Inno Setup installer ([`installer/SignalLight.iss`](installer/SignalLight.iss)), built by the release workflow.
 
 **Firmware updates over Bluetooth** (click-to-update from the dashboard; design and rationale in [docs/FIRMWARE_UPDATES.md](docs/FIRMWARE_UPDATES.md)):
-- [ ] Prototype BLE transfer throughput on ArduinoBLE (decides whether to migrate to NimBLE first)
+- [x] Prototype BLE transfer throughput on ArduinoBLE: ~47 KB/s with flash writes, so the ~469KB firmware takes ~10s; no NimBLE migration needed
 - [ ] Firmware reports its version; dashboard shows it
 - [ ] Release workflow compiles the firmware with `arduino-cli` and attaches the `.bin` + SHA-256
 - [ ] Firmware update receiver: chunk/ack protocol, `Update` library, "updating" LED pattern, rollback self-check
