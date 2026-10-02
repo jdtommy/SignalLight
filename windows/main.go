@@ -37,6 +37,7 @@ func main() {
 	useTray := flag.Bool("tray", true, "Enable Windows system tray icon (default true)")
 	zoomSecret := flag.String("zoom-secret", "", "Zoom webhook verification secret (optional)")
 	checkInterval := flag.Duration("interval", 1*time.Second, "Zoom polling interval")
+	fromInstaller := flag.Bool("from-installer", false, "Set by the installer's final 'Launch SignalLight' step; opens the dashboard if no light is paired yet")
 	flag.Parse()
 
 	// Log to %LOCALAPPDATA%\SignalLight\signallight.log (plus the console, if any).
@@ -59,7 +60,7 @@ func main() {
 	} else if !ok {
 		log.Println("[Startup] SignalLight is already running; opening its dashboard instead.")
 		if cfg.WebPort > 0 {
-			_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", fmt.Sprintf("http://localhost:%d", cfg.WebPort)).Start()
+			openInBrowser(fmt.Sprintf("http://localhost:%d", cfg.WebPort))
 		}
 		return
 	}
@@ -222,6 +223,14 @@ func main() {
 		log.Printf("[Web] Failed to start server: %v", err)
 	}
 
+	// Right after a fresh install, nothing works until a light is paired, so take
+	// the user straight to the dashboard. Upgrades of an already-paired setup, and
+	// normal starts at sign-in (no flag), stay quietly in the tray.
+	if shouldOpenDashboardAfterInstall(*fromInstaller, cfg) {
+		log.Println("[Startup] First launch after install with no paired light; opening the dashboard.")
+		openInBrowser("http://" + displayHost)
+	}
+
 	cleanup := func() {
 		log.Println("\nShutting down SignalLight...")
 		detector.Stop()
@@ -253,4 +262,12 @@ func main() {
 		<-sigChan
 		cleanup()
 	}
+}
+
+func shouldOpenDashboardAfterInstall(fromInstaller bool, cfg *config.Config) bool {
+	return fromInstaller && !(cfg.Paired && cfg.TargetMAC != "")
+}
+
+func openInBrowser(url string) {
+	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 }

@@ -55,7 +55,8 @@ Name: "{autodesktop}\SignalLight"; Filename: "{app}\signallight.exe"; WorkingDir
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "SignalLight"; ValueData: """{app}\signallight.exe"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-Filename: "{app}\signallight.exe"; Description: "{cm:LaunchProgram,SignalLight}"; Flags: nowait postinstall skipifsilent
+; -from-installer makes the app open the dashboard if no light is paired yet.
+Filename: "{app}\signallight.exe"; Parameters: "-from-installer"; Description: "{cm:LaunchProgram,SignalLight}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const
