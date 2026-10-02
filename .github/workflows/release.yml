@@ -1,9 +1,10 @@
 name: Build and sign release
 
 # Push a v* tag to build and sign signallight.exe plus the per-user installer
-# (SignalLight-Setup-<version>.exe) and attach both to a DRAFT release (review the
-# notes, then publish). "Run workflow" builds and signs without releasing, and
-# uploads both as a workflow artifact for testing.
+# (SignalLight-Setup-<version>.exe), compile the light's firmware
+# (signallight-firmware-<version>.bin + .sha256), and attach them all to a DRAFT
+# release (review the notes, then publish). "Run workflow" builds everything
+# without releasing and uploads it as a workflow artifact for testing.
 on:
   push:
     tags: ['v*']
@@ -14,7 +15,56 @@ permissions:
   id-token: write   # OIDC token for the passwordless Azure sign-in
 
 jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Pinned to the versions used for local Arduino IDE builds, so CI produces the
+    # same firmware.
+    env:
+      ESP32_CORE: arduino:esp32@2.0.18-arduino.5
+      ARDUINO_BLE: ArduinoBLE@2.1.0
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 1.5.1
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ env.ESP32_CORE }}-${{ env.ARDUINO_BLE }}
+
+      - name: Install core and libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install "$ESP32_CORE"
+          arduino-cli lib install "$ARDUINO_BLE"
+
+      - name: Compile firmware
+        run: |
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="0.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          arduino-cli compile --fqbn arduino:esp32:nano_nora --output-dir build \
+            --build-property "compiler.cpp.extra_flags=-DSIGNALLIGHT_VERSION=\"${VERSION}\"" \
+            arduino/SignalLight
+          # The light reports this string over BLE; make sure it was really stamped in.
+          grep -a -q -F "$VERSION" build/SignalLight.ino.bin || { echo "::error::version $VERSION not found in firmware"; exit 1; }
+          mkdir -p dist
+          # The app image (not the merged/bootloader images) is what an OTA update writes.
+          cp build/SignalLight.ino.bin "dist/signallight-firmware-${VERSION}.bin"
+          cd dist && sha256sum "signallight-firmware-${VERSION}.bin" > "signallight-firmware-${VERSION}.bin.sha256"
+          cat "signallight-firmware-${VERSION}.bin.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware
+          path: dist/
+
   build-sign:
+    needs: firmware
     runs-on: windows-latest
     # Azure only trusts OIDC tokens issued for this environment
     # (subject repo:jdtommy/SignalLight:environment:release).
@@ -88,14 +138,20 @@ jobs:
           if (-not $sig.TimeStamperCertificate) { throw "Installer signature is not timestamped" }
           "$($setup.Name) signed by: $($sig.SignerCertificate.Subject)"
 
-      - name: Upload signed files (manual runs)
+      - uses: actions/download-artifact@v8
+        with:
+          name: firmware
+          path: firmware
+
+      - name: Upload release files (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
-          name: signallight-signed
+          name: signallight-release-files
           path: |
             windows/signallight.exe
             installer/Output/SignalLight-Setup-*.exe
+            firmware/*
 
       - name: Attach to draft release (tag pushes)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -103,7 +159,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $files = @('windows/signallight.exe') + (Get-ChildItem installer/Output/SignalLight-Setup-*.exe).FullName
+          $files = @('windows/signallight.exe') +
+            (Get-ChildItem installer/Output/SignalLight-Setup-*.exe).FullName +
+            (Get-ChildItem firmware/*).FullName
           gh release view $tag 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag @files --clobber
